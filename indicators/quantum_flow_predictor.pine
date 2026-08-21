@@ -101,54 +101,15 @@ bgDn  = input.color(color.new(color.rgb(255, 71, 80), 92),   "Regime Bear", grou
 // ~~ Preset resolution {
 isCustom = preset == "Custom"
 
-pLen = switch preset
-    "BIST Daily"      => 24
-    "BIST Weekly"     => 16
-    "Crypto Daily"    => 28
-    "Crypto Intraday" => 32
-    => 24
-
-pSli = switch preset
-    "BIST Daily"      => 4
-    "BIST Weekly"     => 3
-    "Crypto Daily"    => 4
-    "Crypto Intraday" => 4
-    => 4
-
-pMem = switch preset
-    "BIST Daily"      => 260
-    "BIST Weekly"     => 160
-    "Crypto Daily"    => 320
-    "Crypto Intraday" => 420
-    => 260
-
-pK = switch preset
-    "BIST Daily"      => 28
-    "BIST Weekly"     => 18
-    "Crypto Daily"    => 32
-    "Crypto Intraday" => 40
-    => 28
-
-pHz = switch preset
-    "BIST Daily"      => 2
-    "BIST Weekly"     => 2
-    "Crypto Daily"    => 2
-    "Crypto Intraday" => 3
-    => 2
-
-pKer = switch preset
-    "BIST Daily"      => 1.0
-    "BIST Weekly"     => 1.2
-    "Crypto Daily"    => 1.0
-    "Crypto Intraday" => 0.9
-    => 1.0
-
-pRec = switch preset
-    "BIST Daily"      => 0.6
-    "BIST Weekly"     => 0.4
-    "Crypto Daily"    => 0.8
-    "Crypto Intraday" => 1.0
-    => 0.6
+// Single-line ternaries on purpose: multi-line `switch` blocks depend on exact
+// 4-space indentation and get mangled by editors that auto-indent on paste.
+pLen = preset == "BIST Weekly" ? 16 : preset == "Crypto Daily" ? 28 : preset == "Crypto Intraday" ? 32 : 24
+pSli = preset == "BIST Weekly" ? 3 : 4
+pMem = preset == "BIST Weekly" ? 160 : preset == "Crypto Daily" ? 320 : preset == "Crypto Intraday" ? 420 : 260
+pK   = preset == "BIST Weekly" ? 18 : preset == "Crypto Daily" ? 32 : preset == "Crypto Intraday" ? 40 : 28
+pHz  = preset == "Crypto Intraday" ? 3 : 2
+pKer = preset == "BIST Weekly" ? 1.2 : preset == "Crypto Intraday" ? 0.9 : 1.0
+pRec = preset == "BIST Weekly" ? 0.4 : preset == "Crypto Daily" ? 0.8 : preset == "Crypto Intraday" ? 1.0 : 0.6
 
 len     = isCustom ? uLen : pLen
 slices  = isCustom ? uSli : pSli
@@ -162,29 +123,10 @@ tDecay  = isCustom ? uDec : 0.7
 // Signal packs
 isSigCustom = sigMode == "Custom"
 
-sEdge = switch sigMode
-    "Early"        => 0.13
-    "Balanced"     => 0.20
-    "Conservative" => 0.30
-    => 0.20
-
-sCoh = switch sigMode
-    "Early"        => 0.22
-    "Balanced"     => 0.34
-    "Conservative" => 0.48
-    => 0.34
-
-sMove = switch sigMode
-    "Early"        => 0.10
-    "Balanced"     => 0.18
-    "Conservative" => 0.30
-    => 0.18
-
-sCool = switch sigMode
-    "Early"        => 1
-    "Balanced"     => 2
-    "Conservative" => 4
-    => 2
+sEdge = sigMode == "Early" ? 0.13 : sigMode == "Conservative" ? 0.30 : 0.20
+sCoh  = sigMode == "Early" ? 0.22 : sigMode == "Conservative" ? 0.48 : 0.34
+sMove = sigMode == "Early" ? 0.10 : sigMode == "Conservative" ? 0.30 : 0.18
+sCool = sigMode == "Early" ? 1    : sigMode == "Conservative" ? 4    : 2
 
 thrEdge  = isSigCustom ? uEdge : sEdge
 thrCoh   = isSigCustom ? uCoh  : sCoh
@@ -265,8 +207,8 @@ f3 = clamp((nz(rsiV, 50.0) - 50.0) / 25.0)                                      
 f4 = clamp((emaF - emaS) / px / atrp)                                                       // trend field
 f5 = clamp((smP - 2.0 * nz(smP[crvN], smP) + nz(smP[2 * crvN], smP)) / px / atrp)           // curvature (acceleration)
 hasVol = not na(volume) and nz(volD) > 0
-f6 = clamp(hasVol ? (volume - nz(volA, volume)) / math.max(nz(volD), 1e-9) * (lr >= 0 ? 1.0 : -1.0)
-                  : ((close - low) - (high - close)) / math.max(high - low, syminfo.mintick) * 2.0)  // flow
+// flow: signed volume surprise, falling back to close location inside the bar
+f6 = clamp(hasVol ? (volume - nz(volA, volume)) / math.max(nz(volD), 1e-9) * (lr >= 0 ? 1.0 : -1.0) : ((close - low) - (high - close)) / math.max(high - low, syminfo.mintick) * 2.0)
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
 
 // ~~ Dimension weights (built once) {
