@@ -1,0 +1,635 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+//
+// Quantum Flow Predictor (Spacetime kNN)
+// Derived in spirit from "AI Predictive Flow (Zeiierman)" but rebuilt as a
+// PROBABILITY-CLOUD forecaster instead of a single averaged point forecast.
+//
+// Idea:
+//   A single historical analogue is one "electron". Looking at one point tells
+//   you almost nothing. Weighting hundreds of analogues at once produces a
+//   cloud - a full distribution of where the next bar(s) can land. We trade the
+//   shape of that cloud (its bias and its collapse/coherence), not a lagging
+//   moving-average crossover.
+//
+//@version=6
+indicator("Quantum Flow Predictor (Spacetime kNN)", "QFP", overlay = false, precision = 2, max_bars_back = 500)
+
+// ~~ Tooltips {
+tPre  = "Preset parameter packs. Choose Custom to unlock every field below."
+tLen  = "Length of the price 'worldline' compared against history, in bars."
+tSli  = "How many time slices of that worldline are sampled. 3-4 is usually enough; more captures shape, costs speed."
+tMem  = "How many past patterns are kept in memory. More memory = richer cloud, slower script."
+tK    = "How many nearest historical analogues form the cloud. Higher = smoother distribution."
+tHz   = "Forecast horizon in bars. 1 = next bar. Raise it for swing/position trading."
+tKer  = "Kernel width. Small = only very close analogues matter (sharp cloud). Large = broad averaging."
+tRec  = "Recency bias. 0 treats 2010 like today. Higher values favour recent market character."
+tDec  = "Time decay across slices. Higher values make the most recent slice dominate the distance metric."
+
+tMode = "Signal aggressiveness. Early fires first and most often, Conservative fires last and least often."
+tEdg  = "Minimum directional bias |2*P(up)-1| required to arm a signal."
+tCoh  = "Minimum coherence (how collapsed the cloud is) required to arm a signal."
+tMov  = "Minimum expected move, in ATR units, required to arm a signal."
+tAda  = "Auto-raise the edge threshold when the instrument is naturally noisy (uses rolling stdev of edge)."
+tCur  = "Require price acceleration (2nd derivative) to agree with the signal direction."
+tHtf  = "Require the higher timeframe trend to agree. Fewer, cleaner signals."
+tCd   = "Minimum bars between two signals."
+tCnf  = "ON = signals only print on closed bars (no repaint). OFF = intrabar, earlier but provisional."
+tEvl  = "Bars used by the built-in signal-quality tracker to score each signal."
+tIgn  = "Lets a strong price thrust open a trade before the memory holds analogues of a brand-new regime. The cloud keeps a veto."
+tIgT  = "How much normalised thrust the ignition path demands. Lower fires earlier and more often."
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Groups {
+gEng = "◆ Engine"
+gSig = "◆ Signals"
+gSty = "◆ Style"
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Preset {
+preset = input.string("BIST Daily", "Preset", options = ["BIST Daily", "BIST Weekly", "Crypto Daily", "Crypto Intraday", "Custom"], tooltip = tPre, group = gEng)
+
+uLen  = input.int(24,   "Pattern Window",    minval = 6,  maxval = 120,  tooltip = tLen, group = gEng)
+uSli  = input.int(4,    "Spacetime Slices",  minval = 2,  maxval = 6,    tooltip = tSli, group = gEng)
+uMem  = input.int(260,  "Memory (patterns)", minval = 60, maxval = 1000, tooltip = tMem, group = gEng)
+uK    = input.int(28,   "Neighbors (K)",     minval = 5,  maxval = 200,  tooltip = tK,   group = gEng)
+uHz   = input.int(1,    "Forecast Horizon",  minval = 1,  maxval = 10,   tooltip = tHz,  group = gEng)
+uKer  = input.float(1.0,"Kernel Width",      minval = 0.2, maxval = 4.0, step = 0.1, tooltip = tKer, group = gEng)
+uRec  = input.float(0.6,"Recency Bias",      minval = 0.0, maxval = 3.0, step = 0.1, tooltip = tRec, group = gEng)
+uDec  = input.float(0.7,"Slice Time Decay",  minval = 0.0, maxval = 3.0, step = 0.1, tooltip = tDec, group = gEng)
+
+wRet = input.float(1.0, "Weight · Return",       minval = 0, maxval = 3, step = 0.1, group = gEng, inline = "w1")
+wMom = input.float(1.0, "Weight · Momentum",     minval = 0, maxval = 3, step = 0.1, group = gEng, inline = "w1")
+wRsi = input.float(0.8, "Weight · RSI",          minval = 0, maxval = 3, step = 0.1, group = gEng, inline = "w2")
+wTrd = input.float(1.0, "Weight · Trend",        minval = 0, maxval = 3, step = 0.1, group = gEng, inline = "w2")
+wCrv = input.float(1.2, "Weight · Curvature",    minval = 0, maxval = 3, step = 0.1, group = gEng, inline = "w3")
+wFlw = input.float(0.6, "Weight · Flow",         minval = 0, maxval = 3, step = 0.1, group = gEng, inline = "w3")
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Signal inputs {
+sigMode  = input.string("Balanced", "Signal Mode", options = ["Early", "Balanced", "Conservative", "Custom"], tooltip = tMode, group = gSig)
+uEdge    = input.float(0.22, "Edge Threshold",        minval = 0.02, maxval = 0.90, step = 0.01, tooltip = tEdg, group = gSig)
+uCoh     = input.float(0.32, "Coherence Threshold",   minval = 0.00, maxval = 0.95, step = 0.01, tooltip = tCoh, group = gSig)
+uMove    = input.float(0.20, "Min Expected Move ATR", minval = 0.00, maxval = 3.00, step = 0.05, tooltip = tMov, group = gSig)
+uAdapt   = input.bool(true,  "Adaptive Thresholds",   tooltip = tAda, group = gSig)
+uCurv    = input.bool(true,  "Curvature Agreement",   tooltip = tCur, group = gSig)
+uHtf     = input.bool(false, "Higher-Timeframe Filter", tooltip = tHtf, group = gSig)
+uCool    = input.int(2,      "Cooldown Bars", minval = 0, maxval = 50, tooltip = tCd, group = gSig)
+uIgnOn   = input.bool(true,  "Momentum Ignition", tooltip = tIgn, group = gSig)
+uIgnThr  = input.float(1.25, "Ignition Thrust", minval = 0.3, maxval = 3.0, step = 0.05, tooltip = tIgT, group = gSig)
+confirmB = input.bool(true,  "Confirm On Bar Close",  tooltip = tCnf, group = gSig)
+evalN    = input.int(5,      "Quality Tracker Horizon", minval = 1, maxval = 60, tooltip = tEvl, group = gSig)
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Style inputs {
+showCloud = input.bool(true,  "Show Probability Cloud", group = gSty)
+showMed   = input.bool(true,  "Show Expected Path",     group = gSty)
+showConv  = input.bool(true,  "Show Conviction",        group = gSty)
+showBg    = input.bool(true,  "Show Regime Background", group = gSty)
+showMarks = input.bool(true,  "Show Entry Markers",     group = gSty)
+showExit  = input.bool(true,  "Show Exit Markers",      group = gSty)
+showTable = input.bool(true,  "Show Dashboard",         group = gSty)
+cloudSm   = input.int(2, "Cloud Smoothing", minval = 1, maxval = 10, group = gSty)
+
+cUp   = input.color(color.rgb(175, 255, 105), "Bull Color", group = gSty, inline = "c1")
+cDn   = input.color(color.rgb(255, 71, 80),   "Bear Color", group = gSty, inline = "c1")
+cNeut = input.color(color.new(color.gray, 30), "Neutral Color", group = gSty)
+bgUp  = input.color(color.new(color.rgb(175, 255, 105), 92), "Regime Bull", group = gSty, inline = "c2")
+bgDn  = input.color(color.new(color.rgb(255, 71, 80), 92),   "Regime Bear", group = gSty, inline = "c2")
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Preset resolution {
+isCustom = preset == "Custom"
+
+pLen = switch preset
+    "BIST Daily"      => 24
+    "BIST Weekly"     => 16
+    "Crypto Daily"    => 28
+    "Crypto Intraday" => 32
+    => 24
+
+pSli = switch preset
+    "BIST Daily"      => 4
+    "BIST Weekly"     => 3
+    "Crypto Daily"    => 4
+    "Crypto Intraday" => 4
+    => 4
+
+pMem = switch preset
+    "BIST Daily"      => 260
+    "BIST Weekly"     => 160
+    "Crypto Daily"    => 320
+    "Crypto Intraday" => 420
+    => 260
+
+pK = switch preset
+    "BIST Daily"      => 28
+    "BIST Weekly"     => 18
+    "Crypto Daily"    => 32
+    "Crypto Intraday" => 40
+    => 28
+
+pHz = switch preset
+    "BIST Daily"      => 2
+    "BIST Weekly"     => 2
+    "Crypto Daily"    => 2
+    "Crypto Intraday" => 3
+    => 2
+
+pKer = switch preset
+    "BIST Daily"      => 1.0
+    "BIST Weekly"     => 1.2
+    "Crypto Daily"    => 1.0
+    "Crypto Intraday" => 0.9
+    => 1.0
+
+pRec = switch preset
+    "BIST Daily"      => 0.6
+    "BIST Weekly"     => 0.4
+    "Crypto Daily"    => 0.8
+    "Crypto Intraday" => 1.0
+    => 0.6
+
+len     = isCustom ? uLen : pLen
+slices  = isCustom ? uSli : pSli
+mem     = isCustom ? uMem : pMem
+kN      = isCustom ? uK   : pK
+hz      = isCustom ? uHz  : pHz
+kernel  = isCustom ? uKer : pKer
+recency = isCustom ? uRec : pRec
+tDecay  = isCustom ? uDec : 0.7
+
+// Signal packs
+isSigCustom = sigMode == "Custom"
+
+sEdge = switch sigMode
+    "Early"        => 0.13
+    "Balanced"     => 0.20
+    "Conservative" => 0.30
+    => 0.20
+
+sCoh = switch sigMode
+    "Early"        => 0.22
+    "Balanced"     => 0.34
+    "Conservative" => 0.48
+    => 0.34
+
+sMove = switch sigMode
+    "Early"        => 0.10
+    "Balanced"     => 0.18
+    "Conservative" => 0.30
+    => 0.18
+
+sCool = switch sigMode
+    "Early"        => 1
+    "Balanced"     => 2
+    "Conservative" => 4
+    => 2
+
+thrEdge  = isSigCustom ? uEdge : sEdge
+thrCoh   = isSigCustom ? uCoh  : sCoh
+thrMove  = isSigCustom ? uMove : sMove
+coolN    = isSigCustom ? uCool : sCool
+sIgnOn = sigMode != "Conservative"
+sIgnThr = sigMode == "Early" ? 0.85 : 1.25
+
+needCurv = isSigCustom ? uCurv   : sigMode != "Early"
+needHtf  = isSigCustom ? uHtf    : sigMode == "Conservative"
+useIgn   = isSigCustom ? uIgnOn  : sIgnOn
+ignThr   = isSigCustom ? uIgnThr : sIgnThr
+IGN_EDGE = 0.10
+IGN_COHF = 0.60
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Constants {
+NF      = 6            // features per slice
+MAXLAG  = 140          // deepest lag the history buffer can serve
+dims    = slices * NF
+momN    = 5
+crvN    = 3
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Storage {
+var array<float> HB   = array.new<float>(MAXLAG * NF, 0.0)   // confirmed feature history, block per bar
+var array<float> MEM  = array.new<float>(0)                  // flattened pattern memory
+var array<float> OUTC = array.new<float>(0)                  // realised outcome per pattern (ATR units)
+var array<int>   MBAR = array.new<int>(0)                    // bar_index each pattern was stored
+var array<float> DW   = array.new<float>(0)                  // per-dimension distance weights
+var int wp = 0
+
+var float pUp   = na
+var float medF  = na
+var float muF   = na
+var float sdF   = na
+var float cohV  = na
+var float edgeV = na
+var float convRaw = 0.0
+var float q05 = na
+var float q20 = na
+var float q35 = na
+var float q50 = na
+var float q65 = na
+var float q80 = na
+var float q95 = na
+var int   nUsed = 0
+
+var int pos      = 0
+var int lastSig  = -10000
+var int wins     = 0
+var int losses   = 0
+var float sumR   = 0.0
+var array<int>   PB = array.new<int>(0)
+var array<float> PP = array.new<float>(0)
+var array<int>   PD = array.new<int>(0)
+var array<float> PA = array.new<float>(0)
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Volatility-normalised features {
+px    = math.max(close, syminfo.mintick)
+atrR  = ta.atr(14)
+atrp  = math.max(nz(atrR / px), 0.00001)
+
+lr    = nz(math.log(px / math.max(nz(close[1], close), syminfo.mintick)))
+rsiV  = ta.rsi(close, 14)
+emaF  = ta.ema(close, 8)
+emaS  = ta.ema(close, 21)
+smP   = ta.ema(close, 5)
+volA  = ta.sma(volume, 20)
+volD  = ta.stdev(volume, 20)
+
+clamp(x) => math.max(-4.0, math.min(4.0, nz(x)))
+
+f1 = clamp(lr / atrp)                                                                       // instantaneous velocity
+f2 = clamp((close - nz(close[momN], close)) / px / (atrp * math.sqrt(momN)))                // momentum
+f3 = clamp((nz(rsiV, 50.0) - 50.0) / 25.0)                                                  // oscillation state
+f4 = clamp((emaF - emaS) / px / atrp)                                                       // trend field
+f5 = clamp((smP - 2.0 * nz(smP[crvN], smP) + nz(smP[2 * crvN], smP)) / px / atrp)           // curvature (acceleration)
+hasVol = not na(volume) and nz(volD) > 0
+f6 = clamp(hasVol ? (volume - nz(volA, volume)) / math.max(nz(volD), 1e-9) * (lr >= 0 ? 1.0 : -1.0)
+                  : ((close - low) - (high - close)) / math.max(high - low, syminfo.mintick) * 2.0)  // flow
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Dimension weights (built once) {
+if DW.size() == 0
+    float tot = 0.0
+    for s = 0 to slices - 1
+        tw = math.exp(-tDecay * s / math.max(slices - 1, 1))
+        for j = 0 to NF - 1
+            fwj = j == 0 ? wRet : j == 1 ? wMom : j == 2 ? wRsi : j == 3 ? wTrd : j == 4 ? wCrv : wFlw
+            v = math.max(tw * fwj, 0.0)
+            DW.push(v)
+            tot += v
+    if tot > 0
+        for d = 0 to dims - 1
+            DW.set(d, DW.get(d) * dims / tot)
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Worldline sampling {
+// off = 0  -> the live pattern (query)
+// off = hz -> the pattern whose outcome is now known (training example)
+buildVec(int off) =>
+    v = array.new<float>(dims, 0.0)
+    den = math.max(slices - 1, 1) * 1.0
+    for s = 0 to slices - 1
+        // geometric spacing: the recent past is resolved finely, the distant
+        // past coarsely - the worldline is sampled densely near "now".
+        lag = int(math.round((len - 1) * math.pow(s / den, 1.6))) + off
+        for j = 0 to NF - 1
+            float val = 0.0
+            if lag == 0
+                val := j == 0 ? f1 : j == 1 ? f2 : j == 2 ? f3 : j == 3 ? f4 : j == 4 ? f5 : f6
+            else
+                idx = (lag - 1) * NF + j
+                val := idx >= 0 and idx < HB.size() ? HB.get(idx) : 0.0
+            v.set(s * NF + j, val)
+    v
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Weighted quantile of the outcome cloud {
+wquant(array<float> vs, array<int> ordr, array<float> wts, float total, float qq) =>
+    int n = vs.size()
+    float res = 0.0
+    if n > 0
+        res := vs.get(ordr.get(n - 1))
+        float target = total * qq
+        float acc = 0.0
+        bool done = false
+        for i = 0 to n - 1
+            if not done
+                acc += wts.get(ordr.get(i))
+                if acc >= target
+                    res := vs.get(ordr.get(i))
+                    done := true
+    res
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Main : collapse the cloud {
+warm = bar_index > len + hz + 40
+qv   = buildVec(0)
+cnt  = OUTC.size()
+bool solved = false
+
+if warm and cnt >= math.max(kN, 20)
+    solved := true
+
+    darr = array.new<float>(cnt, 0.0)
+    for i = 0 to cnt - 1
+        b = i * dims
+        float acc = 0.0
+        for d = 0 to dims - 1
+            df = qv.get(d) - MEM.get(b + d)
+            acc += DW.get(d) * df * df
+        darr.set(i, math.sqrt(acc))
+
+    ordr = darr.sort_indices(order.ascending)
+    useK = math.min(kN, cnt)
+    dK   = math.max(darr.get(ordr.get(useK - 1)), 1e-6)
+    band = math.max(kernel * dK, 1e-6)
+
+    ys = array.new<float>(useK, 0.0)
+    ws = array.new<float>(useK, 0.0)
+    float sw  = 0.0
+    float swU = 0.0
+
+    for i = 0 to useK - 1
+        ix  = ordr.get(i)
+        dd  = darr.get(ix)
+        age = bar_index - MBAR.get(ix)
+        rw  = math.exp(-recency * age / math.max(mem, 1))
+        r   = dd / band
+        w   = math.exp(-r * r) * rw
+        yy  = OUTC.get(ix)
+        ys.set(i, yy)
+        ws.set(i, w)
+        sw  += w
+        if yy > 0
+            swU += w
+
+    sw := math.max(sw, 1e-9)
+    nUsed := useK
+    pUp   := swU / sw
+
+    float sw2 = 0.0
+    for i = 0 to useK - 1
+        sw2 += ws.get(i) * ws.get(i)
+
+    float mu = 0.0
+    for i = 0 to useK - 1
+        mu += ys.get(i) * ws.get(i)
+    mu /= sw
+
+    float vv = 0.0
+    for i = 0 to useK - 1
+        dy = ys.get(i) - mu
+        vv += ws.get(i) * dy * dy
+    float sd = math.sqrt(math.max(vv / sw, 0.0))
+
+    muF := mu
+    sdF := sd
+
+    yord = ys.sort_indices(order.ascending)
+    q05 := wquant(ys, yord, ws, sw, 0.05)
+    q20 := wquant(ys, yord, ws, sw, 0.20)
+    q35 := wquant(ys, yord, ws, sw, 0.35)
+    q50 := wquant(ys, yord, ws, sw, 0.50)
+    q65 := wquant(ys, yord, ws, sw, 0.65)
+    q80 := wquant(ys, yord, ws, sw, 0.80)
+    q95 := wquant(ys, yord, ws, sw, 0.95)
+    medF := q50
+
+    // Coherence = how far the cloud has collapsed onto one answer.
+    // Binary entropy alone is almost flat around p = 0.5, so it is rooted to
+    // give a usable 0..1 scale, and combined with the t-statistic of the
+    // weighted mean over the Kish effective sample size.
+    p    = math.min(math.max(pUp, 1e-6), 1.0 - 1e-6)
+    H    = -(p * math.log(p) + (1.0 - p) * math.log(1.0 - p)) / math.log(2.0)
+    cohD = math.sqrt(math.max(1.0 - H, 0.0))
+    nEff = sw * sw / math.max(sw2, 1e-12)
+    tSt  = math.abs(mu) * math.sqrt(nEff) / math.max(sd, 1e-9)
+    cohT = tSt / (tSt + 1.5)
+    cohV := math.min(1.0, math.max(0.0, 0.5 * cohD + 0.5 * cohT))
+
+    edgeV   := 2.0 * pUp - 1.0
+    convRaw := edgeV * cohV
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Learn : store the pattern whose future is now known {
+if barstate.isconfirmed and warm
+    pv = buildVec(hz)
+    float refP = math.max(nz(close[hz], close), syminfo.mintick)
+    float ap   = math.max(nz(atrp[hz], atrp), 0.00001)
+    float yv   = math.max(-8.0, math.min(8.0, nz(math.log(px / refP)) / ap))
+
+    if OUTC.size() < mem
+        for d = 0 to dims - 1
+            MEM.push(pv.get(d))
+        OUTC.push(yv)
+        MBAR.push(bar_index)
+    else
+        b = wp * dims
+        for d = 0 to dims - 1
+            MEM.set(b + d, pv.get(d))
+        OUTC.set(wp, yv)
+        MBAR.set(wp, bar_index)
+        wp := (wp + 1) % mem
+
+    // roll the confirmed feature history one bar forward
+    HB.unshift(f6)
+    HB.unshift(f5)
+    HB.unshift(f4)
+    HB.unshift(f3)
+    HB.unshift(f2)
+    HB.unshift(f1)
+    for j = 0 to NF - 1
+        HB.pop()
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Low-lag smoothing (zero-lag EMA) {
+zlag = math.max((cloudSm - 1) / 2, 0)
+
+// zero-lag EMA: the de-lagged source is fed to a short EMA, so smoothing costs
+// almost no reaction time. Called unconditionally so each call site keeps state.
+zl(float x) =>
+    float de = x + (x - nz(x[zlag], x))
+    float e  = ta.ema(de, cloudSm)
+    cloudSm > 1 ? e : x
+
+medS  = nz(zl(nz(medF)))
+convS = nz(zl(convRaw))
+c05   = nz(zl(nz(q05)))
+c20   = nz(zl(nz(q20)))
+c35   = nz(zl(nz(q35)))
+c65   = nz(zl(nz(q65)))
+c80   = nz(zl(nz(q80)))
+c95   = nz(zl(nz(q95)))
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Higher timeframe field {
+htfTf  = timeframe.isintraday ? "D" : timeframe.isdaily ? "W" : "M"
+htfRaw = request.security(syminfo.tickerid, htfTf, (ta.ema(close, 10) - ta.ema(close, 30))[1], lookahead = barmerge.lookahead_on)
+htfUp  = nz(htfRaw) > 0
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Adaptive thresholds {
+edgeSer = nz(edgeV)
+edgeSd  = nz(ta.stdev(edgeSer, 150))
+aEdge   = uAdapt ? math.max(thrEdge, edgeSd * 0.9) : thrEdge
+aCoh    = thrCoh
+aMove   = thrMove
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Regime {
+var bool regUp = false
+if solved
+    if convS > 0.04
+        regUp := true
+    if convS < -0.04
+        regUp := false
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Signal state machine {
+bool longOK  = solved and nz(edgeV) >=  aEdge and nz(cohV) >= aCoh and medS >=  aMove and (not needCurv or f5 > -0.10) and (not needHtf or htfUp)
+bool shortOK = solved and nz(edgeV) <= -aEdge and nz(cohV) >= aCoh and medS <= -aMove and (not needCurv or f5 <  0.10) and (not needHtf or not htfUp)
+
+// Momentum ignition. Acceleration leads velocity leads price, so a strong
+// thrust can open a trade before the memory holds analogues of a brand-new
+// regime - the situation where a pure kNN is structurally blind. The cloud
+// still has to lean the same way, so this is a shortcut, not a bypass.
+thrust = 0.5 * f1 + 0.3 * f2 + 0.2 * f5
+bool ignCoh = nz(cohV) >= aCoh * IGN_COHF
+if solved and useIgn
+    if thrust >=  ignThr and f4 > 0 and nz(edgeV) >=  IGN_EDGE and ignCoh
+        longOK := true
+    if thrust <= -ignThr and f4 < 0 and nz(edgeV) <= -IGN_EDGE and ignCoh
+        shortOK := true
+
+bool canFire = warm and (confirmB ? barstate.isconfirmed : true)
+bool newLong = false
+bool newShort = false
+bool flatten  = false
+
+if canFire
+    bool cooled = bar_index - lastSig >= coolN
+    if longOK and pos <= 0 and cooled
+        pos := 1
+        lastSig := bar_index
+        newLong := true
+    else if shortOK and pos >= 0 and cooled
+        pos := -1
+        lastSig := bar_index
+        newShort := true
+    else if pos != 0
+        // the cloud dissolved or flipped -> stand aside
+        bool gone = nz(cohV) < aCoh * 0.45 or (pos == 1 and convS < 0) or (pos == -1 and convS > 0)
+        if gone
+            pos := 0
+            flatten := true
+
+// early-warning pre-signal: cloud starts to lean before it fully collapses
+bool preLong  = solved and not newLong  and pos <= 0 and ta.crossover(nz(edgeV),  aEdge * 0.55) and nz(cohV) >= aCoh * 0.6
+bool preShort = solved and not newShort and pos >= 0 and ta.crossunder(nz(edgeV), -aEdge * 0.55) and nz(cohV) >= aCoh * 0.6
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Built-in signal quality tracker {
+if barstate.isconfirmed
+    if newLong or newShort
+        PB.push(bar_index)
+        PP.push(close)
+        PD.push(newLong ? 1 : -1)
+        PA.push(math.max(atrR, syminfo.mintick))
+    while PB.size() > 0 and bar_index - PB.get(0) >= evalN
+        p0 = PP.shift()
+        d0 = PD.shift()
+        a0 = PA.shift()
+        PB.shift()
+        rr = d0 * (close - p0) / math.max(a0, syminfo.mintick)
+        sumR += rr
+        if rr > 0
+            wins += 1
+        else
+            losses += 1
+
+trades  = wins + losses
+winRate = trades > 0 ? wins / trades * 100.0 : na
+avgR    = trades > 0 ? sumR / trades : na
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Plots {
+hline(0, "Equilibrium", color.new(chart.fg_color, 65))
+
+dirCol   = medS >= 0 ? cUp : cDn
+cohMix   = math.min(math.max(nz(cohV), 0.0), 1.0)
+lineCol  = color.new(dirCol, int(60 - 55 * cohMix))
+
+p05 = plot(showCloud ? c05 : na, "Q05", color = color.new(dirCol, 100), editable = false)
+p20 = plot(showCloud ? c20 : na, "Q20", color = color.new(dirCol, 100), editable = false)
+p35 = plot(showCloud ? c35 : na, "Q35", color = color.new(dirCol, 100), editable = false)
+p65 = plot(showCloud ? c65 : na, "Q65", color = color.new(dirCol, 100), editable = false)
+p80 = plot(showCloud ? c80 : na, "Q80", color = color.new(dirCol, 100), editable = false)
+p95 = plot(showCloud ? c95 : na, "Q95", color = color.new(dirCol, 100), editable = false)
+
+fill(p05, p95, color = color.new(dirCol, int(94 - 6 * cohMix)), title = "Cloud 90%")
+fill(p20, p80, color = color.new(dirCol, int(88 - 8 * cohMix)), title = "Cloud 60%")
+fill(p35, p65, color = color.new(dirCol, int(80 - 12 * cohMix)), title = "Cloud 30%")
+
+plot(showConv ? convS : na, "Conviction", style = plot.style_columns, color = color.new(convS >= 0 ? cUp : cDn, 55))
+plot(showMed  ? medS  : na, "Expected Path", color = lineCol, linewidth = 2)
+
+bgcolor(showBg and solved ? (regUp ? bgUp : bgDn) : na, title = "Regime")
+
+plotshape(showMarks and newLong,  "Long",  shape.triangleup,   location.bottom, cUp,   size = size.tiny)
+plotshape(showMarks and newShort, "Short", shape.triangledown, location.top,    cDn,   size = size.tiny)
+plotchar(showMarks and preLong,   "Early Long",  "•", location.bottom, color.new(cUp, 35), size = size.tiny)
+plotchar(showMarks and preShort,  "Early Short", "•", location.top,    color.new(cDn, 35), size = size.tiny)
+plotchar(showExit and flatten ? 0.0 : na, "Flat", "×", location.absolute, cNeut, size = size.tiny)
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Dashboard {
+var table tb = table.new(position.top_right, 2, 9, border_width = 1, frame_width = 1, frame_color = color.new(chart.fg_color, 70))
+
+if showTable and barstate.islast
+    hdCol = color.new(chart.fg_color, 25)
+    stCol = pos == 1 ? cUp : pos == -1 ? cDn : cNeut
+
+    table.cell(tb, 0, 0, "QUANTUM FLOW", text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(chart.fg_color, 90))
+    table.cell(tb, 1, 0, preset + " / " + sigMode, text_color = hdCol, text_size = size.tiny, bgcolor = color.new(chart.fg_color, 90))
+
+    table.cell(tb, 0, 1, "P(up)", text_color = hdCol, text_size = size.tiny)
+    table.cell(tb, 1, 1, na(pUp) ? "—" : str.tostring(pUp * 100, "#.0") + " %", text_color = nz(pUp, 0.5) >= 0.5 ? cUp : cDn, text_size = size.tiny)
+
+    table.cell(tb, 0, 2, "Coherence", text_color = hdCol, text_size = size.tiny)
+    table.cell(tb, 1, 2, na(cohV) ? "—" : str.tostring(cohV * 100, "#.0") + " %", text_color = chart.fg_color, text_size = size.tiny)
+
+    table.cell(tb, 0, 3, "Expected move", text_color = hdCol, text_size = size.tiny)
+    table.cell(tb, 1, 3, na(medF) ? "—" : str.tostring(medS, "#.00") + " ATR", text_color = medS >= 0 ? cUp : cDn, text_size = size.tiny)
+
+    table.cell(tb, 0, 4, "Target (" + str.tostring(hz) + "b)", text_color = hdCol, text_size = size.tiny)
+    table.cell(tb, 1, 4, na(medF) ? "—" : str.tostring(close + medS * atrR, format.mintick), text_color = chart.fg_color, text_size = size.tiny)
+
+    table.cell(tb, 0, 5, "Cloud width", text_color = hdCol, text_size = size.tiny)
+    table.cell(tb, 1, 5, na(sdF) ? "—" : str.tostring(c95 - c05, "#.00") + " ATR", text_color = chart.fg_color, text_size = size.tiny)
+
+    table.cell(tb, 0, 6, "State", text_color = hdCol, text_size = size.tiny)
+    table.cell(tb, 1, 6, pos == 1 ? "LONG" : pos == -1 ? "SHORT" : "FLAT", text_color = stCol, text_size = size.tiny)
+
+    table.cell(tb, 0, 7, "Hit rate (" + str.tostring(evalN) + "b)", text_color = hdCol, text_size = size.tiny)
+    table.cell(tb, 1, 7, na(winRate) ? "—" : str.tostring(winRate, "#.0") + " %  (" + str.tostring(trades) + ")", text_color = nz(winRate, 50) >= 50 ? cUp : cDn, text_size = size.tiny)
+
+    table.cell(tb, 0, 8, "Avg result", text_color = hdCol, text_size = size.tiny)
+    table.cell(tb, 1, 8, na(avgR) ? "—" : str.tostring(avgR, "#.00") + " ATR", text_color = nz(avgR, 0) >= 0 ? cUp : cDn, text_size = size.tiny)
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Alerts {
+alertcondition(newLong,  "Long Signal",  "QFP: long — probability cloud collapsed upward")
+alertcondition(newShort, "Short Signal", "QFP: short — probability cloud collapsed downward")
+alertcondition(preLong,  "Early Long",   "QFP: cloud leaning up (early warning)")
+alertcondition(preShort, "Early Short",  "QFP: cloud leaning down (early warning)")
+alertcondition(flatten,  "Exit",         "QFP: cloud dissolved — stand aside")
+alertcondition(regUp and not regUp[1],   "Regime Bullish", "QFP: regime flipped bullish")
+alertcondition(not regUp and regUp[1],   "Regime Bearish", "QFP: regime flipped bearish")
+
+if newLong
+    alert("QFP LONG " + syminfo.ticker + " " + timeframe.period + " | P(up) " + str.tostring(nz(pUp) * 100, "#.0") + "% | coh " + str.tostring(nz(cohV) * 100, "#.0") + "% | target " + str.tostring(close + medS * atrR, format.mintick), alert.freq_once_per_bar)
+if newShort
+    alert("QFP SHORT " + syminfo.ticker + " " + timeframe.period + " | P(dn) " + str.tostring((1 - nz(pUp)) * 100, "#.0") + "% | coh " + str.tostring(nz(cohV) * 100, "#.0") + "% | target " + str.tostring(close + medS * atrR, format.mintick), alert.freq_once_per_bar)
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
