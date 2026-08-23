@@ -153,7 +153,7 @@ crvN    = 3
 
 // ~~ Storage {
 var array<float> HB   = array.new<float>(MAXLAG * NF, 0.0)   // confirmed feature history, block per bar
-var array<float> MEM  = array.new<float>(0)                  // flattened pattern memory
+var array<float> MEM  = array.new<float>(mem * dims, 0.0)    // flattened pattern memory, ring buffer
 var array<float> OUTC = array.new<float>(0)                  // realised outcome per pattern (ATR units)
 var array<int>   MBAR = array.new<int>(0)                    // bar_index each pattern was stored
 var array<float> DW   = array.new<float>(0)                  // per-dimension distance weights
@@ -212,38 +212,34 @@ f6 = clamp(hasVol ? (volume - nz(volA, volume)) / math.max(nz(volD), 1e-9) * (lr
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
 
 // ~~ Dimension weights (built once) {
+// One flat pass over the flattened (slice, feature) grid: slice = d / NF and
+// feature = d % NF, so the nested loops collapse into one.
 if DW.size() == 0
-    float tot = 0.0
-    for s = 0 to slices - 1
-        tw = math.exp(-tDecay * s / math.max(slices - 1, 1))
-        for j = 0 to NF - 1
-            fwj = j == 0 ? wRet : j == 1 ? wMom : j == 2 ? wRsi : j == 3 ? wTrd : j == 4 ? wCrv : wFlw
-            v = math.max(tw * fwj, 0.0)
-            DW.push(v)
-            tot += v
-    if tot > 0
-        for d = 0 to dims - 1
-            DW.set(d, DW.get(d) * dims / tot)
+    for d = 0 to dims - 1
+        j   = d % NF
+        tw  = math.exp(-tDecay * (d / NF) / math.max(slices - 1, 1))
+        fwj = j == 0 ? wRet : j == 1 ? wMom : j == 2 ? wRsi : j == 3 ? wTrd : j == 4 ? wCrv : wFlw
+        DW.push(math.max(tw * fwj, 0.0))
+    dwTot = math.max(DW.sum(), 1e-12)
+    for d = 0 to dims - 1
+        DW.set(d, DW.get(d) * dims / dwTot)
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
 
 // ~~ Worldline sampling {
 // off = 0  -> the live pattern (query)
 // off = hz -> the pattern whose outcome is now known (training example)
+// geometric spacing: the recent past is resolved finely, the distant past
+// coarsely - the worldline is sampled densely near "now". lag 0 is the live
+// bar, every deeper lag comes from the confirmed history buffer.
 buildVec(int off) =>
     v = array.new<float>(dims, 0.0)
     den = math.max(slices - 1, 1) * 1.0
-    for s = 0 to slices - 1
-        // geometric spacing: the recent past is resolved finely, the distant
-        // past coarsely - the worldline is sampled densely near "now".
-        lag = int(math.round((len - 1) * math.pow(s / den, 1.6))) + off
-        for j = 0 to NF - 1
-            float val = 0.0
-            if lag == 0
-                val := j == 0 ? f1 : j == 1 ? f2 : j == 2 ? f3 : j == 3 ? f4 : j == 4 ? f5 : f6
-            else
-                idx = (lag - 1) * NF + j
-                val := idx >= 0 and idx < HB.size() ? HB.get(idx) : 0.0
-            v.set(s * NF + j, val)
+    for d = 0 to dims - 1
+        j    = d % NF
+        lag  = int(math.round((len - 1) * math.pow((d / NF) / den, 1.6))) + off
+        idx  = (lag - 1) * NF + j
+        live = j == 0 ? f1 : j == 1 ? f2 : j == 2 ? f3 : j == 3 ? f4 : j == 4 ? f5 : f6
+        v.set(d, lag == 0 ? live : (idx >= 0 and idx < HB.size() ? HB.get(idx) : 0.0))
     v
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
 
@@ -257,11 +253,10 @@ wquant(array<float> vs, array<int> ordr, array<float> wts, float total, float qq
         float acc = 0.0
         bool done = false
         for i = 0 to n - 1
-            if not done
-                acc += wts.get(ordr.get(i))
-                if acc >= target
-                    res := vs.get(ordr.get(i))
-                    done := true
+            k = ordr.get(i)
+            acc += done ? 0.0 : wts.get(k)
+            res := not done and acc >= target ? vs.get(k) : res
+            done := done or acc >= target
     res
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
 
@@ -292,33 +287,26 @@ if warm and cnt >= math.max(kN, 20)
     ws = array.new<float>(useK, 0.0)
     float sw  = 0.0
     float swU = 0.0
+    float sw2 = 0.0
+    float syw = 0.0
 
     for i = 0 to useK - 1
         ix  = ordr.get(i)
-        dd  = darr.get(ix)
-        age = bar_index - MBAR.get(ix)
-        rw  = math.exp(-recency * age / math.max(mem, 1))
-        r   = dd / band
+        rw  = math.exp(-recency * (bar_index - MBAR.get(ix)) / math.max(mem, 1))
+        r   = darr.get(ix) / band
         w   = math.exp(-r * r) * rw
         yy  = OUTC.get(ix)
         ys.set(i, yy)
         ws.set(i, w)
         sw  += w
-        if yy > 0
-            swU += w
+        sw2 += w * w
+        syw += yy * w
+        swU += yy > 0 ? w : 0.0
 
     sw := math.max(sw, 1e-9)
     nUsed := useK
     pUp   := swU / sw
-
-    float sw2 = 0.0
-    for i = 0 to useK - 1
-        sw2 += ws.get(i) * ws.get(i)
-
-    float mu = 0.0
-    for i = 0 to useK - 1
-        mu += ys.get(i) * ws.get(i)
-    mu /= sw
+    float mu = syw / sw
 
     float vv = 0.0
     for i = 0 to useK - 1
@@ -362,15 +350,14 @@ if barstate.isconfirmed and warm
     float ap   = math.max(nz(atrp[hz], atrp), 0.00001)
     float yv   = math.max(-8.0, math.min(8.0, nz(math.log(px / refP)) / ap))
 
-    if OUTC.size() < mem
-        for d = 0 to dims - 1
-            MEM.push(pv.get(d))
+    bool growing = OUTC.size() < mem
+    slot = growing ? OUTC.size() : wp
+    for d = 0 to dims - 1
+        MEM.set(slot * dims + d, pv.get(d))
+    if growing
         OUTC.push(yv)
         MBAR.push(bar_index)
     else
-        b = wp * dims
-        for d = 0 to dims - 1
-            MEM.set(b + d, pv.get(d))
         OUTC.set(wp, yv)
         MBAR.set(wp, bar_index)
         wp := (wp + 1) % mem
@@ -463,9 +450,8 @@ if canFire
     else if pos != 0
         // the cloud dissolved or flipped -> stand aside
         bool gone = nz(cohV) < aCoh * 0.45 or (pos == 1 and convS < 0) or (pos == -1 and convS > 0)
-        if gone
-            pos := 0
-            flatten := true
+        pos := gone ? 0 : pos
+        flatten := gone
 
 // early-warning pre-signal: cloud starts to lean before it fully collapses
 bool preLong  = solved and not newLong  and pos <= 0 and ta.crossover(nz(edgeV),  aEdge * 0.55) and nz(cohV) >= aCoh * 0.6
@@ -485,11 +471,9 @@ if barstate.isconfirmed
         a0 = PA.shift()
         PB.shift()
         rr = d0 * (close - p0) / math.max(a0, syminfo.mintick)
-        sumR += rr
-        if rr > 0
-            wins += 1
-        else
-            losses += 1
+        sumR   += rr
+        wins   += rr > 0 ? 1 : 0
+        losses += rr > 0 ? 0 : 1
 
 trades  = wins + losses
 winRate = trades > 0 ? wins / trades * 100.0 : na
