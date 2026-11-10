@@ -1,0 +1,42 @@
+{
+  "expo": {
+    "name": "BioFix AI",
+    "slug": "biofix-ai",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.biofix.ai"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#0B2F4E",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "com.biofix.ai"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-localization",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "BioFix AI arıza ve onarım fotoğraflarını eklemek için fotoğraflarına erişir.",
+          "cameraPermission": "BioFix AI arızalı cihazın fotoğrafını çekmek için kameranı kullanır."
+        }
+      ]
+    ],
+    "scheme": "biofix",
+    "experiments": {
+      "typedRoutes": false
+    }
+  }
+}
