@@ -455,3 +455,27 @@ test('the developer panel shows how many accounts have verified their address', 
   const overview = (await app.call('GET', '/admin/overview', undefined, t, ADMIN)).json;
   assert.deepEqual(overview.accounts, { verified: 2, pending: 1 });
 });
+
+test('with a device selected only its own manual and solutions are used; an unknown device gets the best general matches', async () => {
+  const { service, seen } = fakeAi();
+  const app = await makeApp(service);
+  const t = await app.register('scope@example.com');
+  const q = 'Açılışta ekran donuyor, dokunmatik tepki vermiyor';
+
+  const own = await app.call('POST', '/diagnose', { q, dev: PM12 }, t);
+  assert.ok(own.json.quick.sols.length > 0 && own.json.quick.docs.length > 0);
+  assert.deepEqual([...new Set(own.json.quick.sols.map((x: any) => `${x.brand} ${x.model}`))], [PM12], 'no other device\'s fix among the instant results');
+  assert.deepEqual([...new Set(own.json.quick.docs.map((d: any) => d.title))], ['Hasta monitörü güç kartı arıza giderme']);
+  const sent = seen.inputs[seen.inputs.length - 1];
+  assert.ok(sent.hits.every((e) => e.doc.model === 'Hasta Monitörü PM-12'), 'the AI is not handed another device\'s procedure');
+  assert.ok(sent.sols.every((e) => e.sol.model === 'Hasta Monitörü PM-12'));
+
+  // Nobody has written about this device yet: similar faults on other devices are better than nothing.
+  const unknown = await app.call('POST', '/diagnose', { q, dev: 'Acme Monitor Z1' }, t);
+  assert.ok(unknown.json.quick.sols.some((x: any) => x.model === 'MX450'));
+  // No device chosen: everything is searched.
+  const any = await app.call('POST', '/diagnose', { q: 'batarya kapasite testi', dev: '' }, t);
+  assert.ok(new Set(any.json.quick.docs.map((d: any) => d.title)).size > 1, 'sections from more than one manual');
+  const mine = await app.call('POST', '/diagnose', { q: 'batarya kapasite testi', dev: PM12 }, t);
+  assert.deepEqual([...new Set(mine.json.quick.docs.map((d: any) => d.title))], ['Hasta monitörü güç kartı arıza giderme']);
+});

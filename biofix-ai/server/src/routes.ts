@@ -85,6 +85,17 @@ async function checkFile(f: z.infer<typeof FileZ> | null | undefined): Promise<a
   return { kind: 'text', name, text };
 }
 
+/**
+ * Search results to use for a fault on `dev`. When the device has material of its own, only that is
+ * kept (plus material that names no device): another device's procedure next to it would mislead.
+ * For a device nobody has written about yet, the best matches overall are better than nothing.
+ */
+function forDevice<T>(found: T[], dev: string, deviceOf: (x: T) => string, n: number): T[] {
+  if (!dev.trim()) return found.slice(0, n);
+  const fits = found.filter((x) => !deviceOf(x) || sameDevice(deviceOf(x), dev));
+  return (fits.some((x) => deviceOf(x)) ? fits : found).slice(0, n);
+}
+
 /** The error code to show for anything thrown while a response is already streaming. */
 function codeOf(e: unknown): string {
   if (e instanceof HttpError) return e.code;
@@ -242,7 +253,8 @@ export function createRouter(store: Store, deps: Deps) {
   function runPrecheck(s: Solution, photo: z.infer<typeof ImageZ> | null, lang: Lang) {
     if (!AI.aiConfigured()) return;
     pendingChecks.add(s.id);
-    const hits = store.index.search(`${devOf(s)} ${s.symptom} ${s.steps}`, devOf(s), 5, 'doc');
+    // Compared with the manual of the same device where there is one.
+    const hits = forDevice(store.index.search(`${devOf(s)} ${s.symptom} ${s.steps}`, devOf(s), 20, 'doc'), devOf(s), (e) => devOf(e.doc), 5);
     AI.precheck(s, hits, photo, lang)
       .then(({ ai: check, photoNote }) => {
         s.ai = check;
@@ -601,11 +613,12 @@ export function createRouter(store: Store, deps: Deps) {
 
     // Step 1 — instant, no AI: what the manuals and other technicians already say about this.
     const qq = `${q} ${b.dev}`;
-    const hits = store.index.search(qq, b.dev, 8, 'doc');
+    const hits = forDevice(store.index.search(qq, b.dev, 24, 'doc'), b.dev, (e) => devOf(e.doc), 8);
     // Never suggest a fix that failed for others or that the AI pre-check flagged as dangerous.
-    const sols = store.index.search(qq, b.dev, 8, 'sol')
-      .filter((e) => solStatus(e.sol) !== 'rej' && !e.sol.ai?.safe)
-      .slice(0, 4);
+    const sols = forDevice(
+      store.index.search(qq, b.dev, 24, 'sol').filter((e) => solStatus(e.sol) !== 'rej' && !e.sol.ai?.safe),
+      b.dev, (e) => devOf(e.sol), 4,
+    );
     const codes = store.index.lookupCodes(q, b.dev);
     const srcs = hits.map((e) => ({ title: e.doc.title, h: e.doc.chunks[e.ci].h, t: e.doc.chunks[e.ci].t }));
     const quick = {

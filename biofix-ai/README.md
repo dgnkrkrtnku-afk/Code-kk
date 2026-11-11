@@ -49,6 +49,9 @@ Bir arıza gönderildiğinde yanıt üç katmanda gelir; ilk ikisi yapay zekâ b
    kodu tablosunda aranır; anlamı ve çaresi en üstte gösterilir. Başka cihazın aynı adlı kodu gösterilmez.
 2. **Hızlı sonuçlar.** Aynı cihazda doğrulanmış topluluk çözümleri ve en ilgili kılavuz bölümleri.
    Arama Türkçe karakter yazılmasa da çalışır ve Türkçe arızayı İngilizce kılavuzda (ya da tersini) bulur.
+   Cihaz seçiliyken ve o cihazın kendi kılavuzu ya da çözümü varken yalnızca onlar kullanılır; başka
+   cihazın prosedürü ne ekrana ne de AI'a gider. Hakkında henüz hiçbir şey yüklenmemiş bir cihazda ise
+   benzer arızalar için genel sonuçlar gösterilir (kartlarda hangi cihaza ait olduğu yazar).
 3. **AI teşhisi.** Yazılırken ekrana akar: önce özet ve **“ilk yapılacak”** iş, sonra nedenler, adımlar,
    parçalar, uyarılar. Sonunda teşhisi netleştirecek 1-3 soru önerir; yanıtlanınca devam yanıtı da akarak gelir.
 
