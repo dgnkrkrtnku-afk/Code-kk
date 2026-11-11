@@ -8,19 +8,27 @@ import { ADMIN, fakeAi, JPEG, makeApp } from './helpers.js';
 
 const PM12 = 'Örnek Hasta Monitörü PM-12';
 
-/** A PDF with real text on every page (as exported manuals have), or blank pages (as scans have). */
-async function pdf(pages: number, textOnPages: boolean): Promise<string> {
+const PIXEL = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+
+/**
+ * A PDF made of the given kinds of page: real text (as exported manuals have), a full-page picture
+ * with no text (as scans have), or nothing at all (a blank separator page).
+ */
+async function pdfOf(kinds: ('text' | 'scan' | 'blank')[]): Promise<string> {
   const doc = await PDFDocument.create();
   const font = await doc.embedFont(StandardFonts.Helvetica);
-  for (let i = 0; i < pages; i++) {
+  const picture = await doc.embedPng(PIXEL);
+  kinds.forEach((kind, i) => {
     const page = doc.addPage([595, 842]);
-    if (!textOnPages) continue;
+    if (kind === 'scan') page.drawImage(picture, { x: 0, y: 0, width: 595, height: 842 });
+    if (kind !== 'text') return;
     for (let line = 0; line < 8; line++) {
       page.drawText(`Page ${i + 1} line ${line + 1}: check the power supply board and measure test point TP${line + 1}.`, { x: 40, y: 780 - line * 20, size: 10, font });
     }
-  }
+  });
   return Buffer.from(await doc.save()).toString('base64');
 }
+const pdf = (pages: number, textOnPages: boolean) => pdfOf(new Array(pages).fill(textOnPages ? 'text' : 'scan'));
 
 async function proUser(app: Awaited<ReturnType<typeof makeApp>>, email: string) {
   const t = await app.register(email);
@@ -252,8 +260,46 @@ test('a PDF with a text layer is read directly; a scanned one is read by the AI 
 test('without an AI key a scanned PDF is refused with a clear reason', async () => {
   const { call, register } = await makeApp();
   const t = await register('dev2@example.com');
-  assert.equal((await call('POST', '/admin/ingest-pdf', { data: await pdf(2, false) }, t, ADMIN)).json.error, 'pdf_empty');
-  assert.equal((await call('POST', '/admin/ingest-pdf', { data: await pdf(2, true) }, t, ADMIN)).json.mode, 'text');
+  const post = async (data: string) => (await call('POST', '/admin/ingest-pdf', { data }, t, ADMIN)).json;
+  assert.equal((await post(await pdf(2, false))).error, 'pdf_empty');
+  assert.equal((await post(await pdf(12, false))).error, 'pdf_empty', 'however many pages: page markers are not text');
+  assert.equal((await post(await pdfOf(['blank', 'blank', 'blank']))).error, 'pdf_empty');
+  const direct = await post(await pdf(2, true));
+  assert.deepEqual([direct.mode, direct.scanned], ['text', 0]);
+  assert.doesNotMatch(direct.text, /-- \d+ of \d+ --/, 'no page markers in the manual text');
+  // Part of the manual is scanned: the readable pages are returned, and the app is told the rest is missing.
+  const mixed = await post(await pdfOf(['text', 'scan', 'scan', 'text', 'blank']));
+  assert.deepEqual([mixed.mode, mixed.pages, mixed.scanned], ['text', 5, 2]);
+  assert.match(mixed.text, /Page 1 line 1/);
+  assert.match(mixed.text, /Page 4 line 8/);
+});
+
+test('in a manual that is partly scanned the AI reads only the pages without text, and the order is kept', async () => {
+  const { service, seen } = fakeAi();
+  const { call, register } = await makeApp(service);
+  const t = await register('dev5@example.com');
+  const layout = ['text', 'text', 'scan', 'text', 'scan', 'scan', 'scan', 'scan', 'scan', 'blank', 'text'] as const;
+  const r = await call('POST', '/admin/ingest-pdf', { data: await pdfOf([...layout]), name: 'Mixed' }, t, ADMIN);
+  assert.deepEqual([r.json.mode, r.json.pages, r.json.scanned], ['ai', 11, 6]);
+  let job: any;
+  for (let i = 0; i < 100; i++) {
+    job = (await call('GET', `/admin/jobs/${r.json.job}`, undefined, t, ADMIN)).json;
+    if (job.status !== 'running') break;
+    await new Promise((res) => setTimeout(res, 10));
+  }
+  assert.equal(job.status, 'done');
+  // Page 3 on its own, pages 5-9 as a group of four and one more; the blank page 10 costs nothing.
+  assert.deepEqual([...seen.pdfs].sort(), ['Mixed p.3-3', 'Mixed p.5-8', 'Mixed p.9-9']);
+  assert.deepEqual([job.done, job.total], [3, 3]);
+  const order = ['Page 1 line 1', 'Page 2 line 1', 'Mixed p.3-3', 'Page 4 line 1', 'Mixed p.5-8', 'Mixed p.9-9', 'Page 11 line 1'].map((x) => job.text.indexOf(x));
+  assert.ok(order.every((at) => at >= 0), 'every page is in the text');
+  assert.deepEqual(order, [...order].sort((a, b) => a - b), 'in page order');
+
+  // A manual with text on every page and a blank separator needs no AI at all.
+  const before = seen.pdfs.length;
+  const plain = await call('POST', '/admin/ingest-pdf', { data: await pdfOf(['text', 'blank', 'text']) }, t, ADMIN);
+  assert.deepEqual([plain.json.mode, plain.json.scanned], ['text', 0]);
+  assert.equal(seen.pdfs.length, before);
 });
 
 test('a new manual is indexed by the AI in the background: Turkish search words and error codes', async () => {

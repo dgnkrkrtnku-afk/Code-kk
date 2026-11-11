@@ -14,7 +14,7 @@ import type { DeviceLabel, Diagnosis, FilePayload, HistoryItem, ImagePayload, Qu
 const MAX_PHOTOS = 4;
 
 export default function Assistant() {
-  const { c, t, api, me, refreshMe, errText, toast } = useApp();
+  const { c, t, api, me, refreshMe, errText, toast, version } = useApp();
   const [devices, setDevices] = useState<string[]>([]);
   const [dev, setDev] = useState('');
   const [q, setQ] = useState('');
@@ -38,16 +38,19 @@ export default function Assistant() {
       setHistory(h.items);
     } catch { /* the status line shows connection problems */ }
   }, [api]);
-  useEffect(() => { load(); }, [load, me?.user.id]);
+  // `version` changes when something was added elsewhere in the app (a manual, a taught solution).
+  useEffect(() => { load(); }, [load, me?.user.id, version]);
 
   // Shortcuts for the selected device: faults others solved on it, and its error codes.
+  const shortcutsFor = useRef('');
   useEffect(() => {
-    setShortcuts(null);
+    if (shortcutsFor.current !== dev) setShortcuts(null); // another device: the old chips would be wrong
+    shortcutsFor.current = dev;
     if (!dev) return;
     let alive = true;
     api.get<QuickList>('/quick' + qs({ dev })).then((r) => { if (alive) setShortcuts(r); }).catch(() => {});
     return () => { alive = false; };
-  }, [api, dev]);
+  }, [api, dev, version]);
 
   const plan = me?.plan;
   const status = !me
@@ -118,8 +121,13 @@ export default function Assistant() {
         else if (e.type === 'partial') setPartial(e.res);
         else if (e.type === 'done') {
           setPartial(null);
-          if (e.item) { const item = e.item; setCur(item); setHistory((h) => [item, ...h.filter((x) => x.id !== item.id)]); }
-          else setAiOff(true);
+          if (e.item) {
+            const item = e.item;
+            setCur(item);
+            setHistory((h) => [item, ...h.filter((x) => x.id !== item.id)]);
+            // The saved record says what was attached; the next fault must not silently carry these along.
+            setPhotos([]); setFile(null);
+          } else setAiOff(true);
         }
       }, ctl.current.signal);
       refreshMe();

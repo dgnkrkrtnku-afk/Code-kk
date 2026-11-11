@@ -69,8 +69,10 @@ export default function Developer() {
       let text = f.text || '';
       if (f.pdfBase64) {
         setBusy(t('k_reading'));
-        const r = await api.post<{ mode: 'text' | 'ai'; text?: string; job?: string }>('/admin/ingest-pdf', { data: f.pdfBase64, name: f.name, ai });
+        const r = await api.post<{ mode: 'text' | 'ai'; scanned: number; text?: string; job?: string }>('/admin/ingest-pdf', { data: f.pdfBase64, name: f.name, ai });
         text = r.mode === 'ai' && r.job ? await waitForJob(r.job) : r.text || '';
+        // Without AI on the server the scanned pages of a mixed manual are missing from the text: say so.
+        if (r.mode === 'text' && r.scanned > 0) toast(t('k_scanned_n', r.scanned));
       }
       if (!alive.current) return;
       setDocDraft({ name: f.name, text });
@@ -175,11 +177,11 @@ export default function Developer() {
         </Row>
         {data.ai ? (
           <>
-            <Btn kind="sec" full style={{ marginTop: 8 }} title={t('k_pdf_ai')} disabled={!!busy} onPress={() => fromFile(true)} />
             <Row style={{ marginTop: 8 }}>
               <Btn kind="sec" style={{ flex: 1 }} title={t('k_page')} disabled={!!busy} onPress={() => fromPages('camera')} />
               <Btn kind="sec" style={{ flex: 1 }} title={t('k_pages')} disabled={!!busy} onPress={() => fromPages('library')} />
             </Row>
+            <Btn kind="sec" full style={{ marginTop: 8 }} title={t('k_pdf_ai')} disabled={!!busy} onPress={() => fromFile(true)} />
             <P small muted style={{ marginTop: 8 }}>{t('k_pdf_ai_d')}</P>
           </>
         ) : null}

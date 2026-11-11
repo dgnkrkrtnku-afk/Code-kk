@@ -1,6 +1,6 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { timingSafeEqual } from 'node:crypto';
-import { PDFDocument } from 'pdf-lib';
+import { PDFArray, PDFDict, PDFDocument, PDFName, PDFStream, type PDFPage } from 'pdf-lib';
 import { PDFParse } from 'pdf-parse';
 import { z } from 'zod';
 import * as ai from './ai.js';
@@ -989,26 +989,54 @@ export function createRouter(store: Store, deps: Deps) {
   interface Job { status: 'running' | 'done' | 'failed'; done: number; total: number; text: string; error: string; at: number }
   const jobs = new Map<string, Job>();
   const PAGES_PER_CALL = 4;
+  const letters = (text: string) => text.replace(/\s/g, '').length;
+  /** Fewer characters than this on a page means its text layer is missing (a scan) or it is a drawing. */
+  const MIN_PAGE_TEXT = 40;
 
-  async function readPdf(job: Job, pdf: PDFDocument, name: string) {
-    const parts: string[] = new Array<string>(job.total).fill('');
-    const all = pdf.getPageIndices();
+  /** A page with nothing drawn on it (a blank separator). When in doubt the answer is no, and the AI looks at the page. */
+  function blankPage(page: PDFPage): boolean {
+    try {
+      const xobjects = page.node.Resources()?.lookup(PDFName.of('XObject'));
+      if (xobjects instanceof PDFDict && xobjects.keys().length) return false; // an image (a scan) or an embedded drawing
+      const contents = page.node.Contents();
+      const streams = contents instanceof PDFArray ? contents.asArray().map((ref) => page.doc.context.lookup(ref)) : contents ? [contents] : [];
+      return streams.reduce((n, st) => n + (st instanceof PDFStream ? st.getContentsSize() : 0), 0) < 64;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Consecutive page numbers, at most PAGES_PER_CALL together, so each transcript can be put back in its place. */
+  function pageGroups(indices: number[]): number[][] {
+    const groups: number[][] = [];
+    for (const i of indices) {
+      const last = groups[groups.length - 1];
+      if (last && last.length < PAGES_PER_CALL && last[last.length - 1] === i - 1) last.push(i);
+      else groups.push([i]);
+    }
+    return groups;
+  }
+
+  /**
+   * The AI reads the given page groups; `slots` holds the text of every page in order and already
+   * contains the pages whose own text layer was good enough.
+   */
+  async function readPdf(job: Job, pdf: PDFDocument, name: string, groups: number[][], slots: string[]) {
     let next = 0;
     const worker = async () => {
       while (job.status === 'running') {
-        const n = next++;
-        if (n >= job.total) return;
-        const idx = all.slice(n * PAGES_PER_CALL, (n + 1) * PAGES_PER_CALL);
+        const idx = groups[next++];
+        if (!idx) return;
         const part = await PDFDocument.create();
         (await part.copyPages(pdf, idx)).forEach((page) => part.addPage(page));
         const data = Buffer.from(await part.save()).toString('base64');
-        parts[n] = await AI.transcribePdf(data, `${name} p.${idx[0] + 1}-${idx[idx.length - 1] + 1}`);
+        slots[idx[0]] = await AI.transcribePdf(data, `${name} p.${idx[0] + 1}-${idx[idx.length - 1] + 1}`);
         job.done++;
       }
     };
     try {
       await Promise.all([worker(), worker()]); // two page groups at a time
-      job.text = parts.filter(Boolean).join('\n\n');
+      job.text = slots.filter(Boolean).join('\n\n');
       job.status = 'done';
     } catch (e) {
       job.status = 'failed';
@@ -1145,26 +1173,35 @@ export function createRouter(store: Store, deps: Deps) {
     if (pages < 1) throw bad('pdf_failed');
     if (pages > 600) throw bad('file_too_long');
 
-    // The quick way: the PDF's own text layer.
-    let layer = '';
+    // The quick way: the PDF's own text layer, page by page.
+    let own: string[] = [];
     const parser = new PDFParse({ data: bytes });
-    try { layer = (await parser.getText()).text || ''; } catch { layer = ''; } finally { await parser.destroy().catch(() => {}); }
-    const hasText = layer.replace(/\s/g, '').length >= Math.max(40, pages * 120);
-    if ((hasText && !b.ai) || !AI.aiConfigured()) {
-      if (layer.replace(/\s/g, '').length < 40) throw bad('pdf_empty'); // scanned, and no AI to read it
-      res.json({ mode: 'text', pages, text: layer });
+    try { own = (await parser.getText({ pageJoiner: '' })).pages.map((pg) => pg.text.trim()); } catch { own = []; } finally { await parser.destroy().catch(() => {}); }
+    const slots = Array.from({ length: pages }, (_, i) => own[i] ?? '');
+    // Pages the text layer does not cover: scans and drawings. Blank separator pages are left alone.
+    const unread = slots.flatMap((text, i) => (letters(text) < MIN_PAGE_TEXT && !blankPage(pdf.getPage(i)) ? [i] : []));
+    const toRead = b.ai ? slots.map((_, i) => i) : unread;
+
+    if (!AI.aiConfigured() || !toRead.length) {
+      const text = slots.filter(Boolean).join('\n\n');
+      if (letters(text) < MIN_PAGE_TEXT) throw bad('pdf_empty'); // scanned, and no AI to read it
+      // `scanned`: pages that could not be read this way, so the app can say the text is incomplete.
+      res.json({ mode: 'text', pages, scanned: unread.length, text });
       return;
     }
 
-    // Scanned or picture-heavy: the AI reads the pages, a few at a time, in the background.
+    // Scanned or picture-heavy pages: the AI reads them, a few at a time, in the background.
+    // Pages with a good text layer keep it, which is quicker, cheaper and exact.
     for (const [id, j] of jobs) if (j.status !== 'running' && Date.now() - j.at > HOUR) jobs.delete(id);
     if ([...jobs.values()].filter((j) => j.status === 'running').length >= 2) throw new HttpError(429, 'slow_down');
+    const groups = pageGroups(toRead);
+    for (const i of toRead) slots[i] = '';
     const id = uid();
-    const job: Job = { status: 'running', done: 0, total: Math.ceil(pages / PAGES_PER_CALL), text: '', error: '', at: Date.now() };
+    const job: Job = { status: 'running', done: 0, total: groups.length, text: '', error: '', at: Date.now() };
     jobs.set(id, job);
-    audit('admin_pdf_ai_read', { by: req.ctx.user.id, pages });
-    void readPdf(job, pdf, b.name);
-    res.json({ mode: 'ai', pages, job: id });
+    audit('admin_pdf_ai_read', { by: req.ctx.user.id, pages: toRead.length });
+    void readPdf(job, pdf, b.name, groups, slots);
+    res.json({ mode: 'ai', pages, scanned: toRead.length, job: id });
   }));
 
   r.get('/admin/jobs/:id', wrap((req, res) => {
