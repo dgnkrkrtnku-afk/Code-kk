@@ -14,6 +14,7 @@ import { chunkText, devOf, NEED_OK, prefixMatchCount, solStatus } from './kb.js'
 import type { Mailer } from './mailer.js';
 import { isPlan, PLANS, planForClient, planPrice, PT, PT_PER_USD, ptsFor } from './plans.js';
 import type { PlayClient } from './play.js';
+import { COUNTRIES } from './seed.js';
 import { todayKey, uid, type Store } from './store.js';
 import type { Course, HistoryItem, Lang, Listing, Solution, User } from './types.js';
 
@@ -192,8 +193,8 @@ export function createRouter(store: Store, deps: Deps) {
     if (!s.userId || s.rewarded || solStatus(s) !== 'ver') return;
     const owner = db().users[s.userId];
     if (!owner) return;
-    s.rewarded = true;
-    store.award(owner, PT.verified, 'pt_verified');
+    // Over today's limit the reward is not lost: it is paid the next time someone confirms the solution.
+    if (store.reward(owner, 'verified')) s.rewarded = true;
   }
 
   /* ================================================================ public: health, sign-in */
@@ -515,7 +516,7 @@ export function createRouter(store: Store, deps: Deps) {
   r.get('/solutions', wrap((req, res) => {
     const c = req.ctx;
     const tab = String(req.query.tab || 'verify');
-    const q = String(req.query.q || '');
+    const q = String(req.query.q || '').slice(0, 200);
     const list = db().sols.filter((s) => {
       if (q && !prefixMatchCount(q, `${devOf(s)} ${s.symptom} ${s.code}`)) return false;
       if (tab === 'mine') return s.userId === c.user.id;
@@ -604,7 +605,7 @@ export function createRouter(store: Store, deps: Deps) {
     res.json({ item: courseView(co, req.ctx, true) });
   }));
 
-  r.post('/courses', wrap((req, res) => {
+  r.post('/courses', body('1mb'), wrap((req, res) => {
     const c = req.ctx;
     if (!PLANS[c.user.plan].teach) throw new HttpError(402, 'plan_required');
     const b = parse(z.object({
@@ -623,8 +624,8 @@ export function createRouter(store: Store, deps: Deps) {
     res.json({ item: courseView(co, c, true) });
   }));
 
-  const sell = (co: Course) => {
-    db().sales.unshift({ courseId: co.id, title: co.title, usd: co.usd, fee: (co.usd * db().fee) / 100, sellerId: co.ownerId, date: todayKey() });
+  const sell = (co: Course, how: 'pts' | 'card' | 'demo') => {
+    db().sales.unshift({ courseId: co.id, title: co.title, usd: co.usd, fee: (co.usd * db().fee) / 100, sellerId: co.ownerId, date: todayKey(), how });
     co.n++;
   };
 
@@ -642,7 +643,7 @@ export function createRouter(store: Store, deps: Deps) {
       throw bad('use_points'); // outside demo mode courses are paid with points (bought through Google Play)
     }
     c.user.owned.push(co.id);
-    sell(co);
+    sell(co, how === 'pts' ? 'pts' : 'demo');
     store.save();
     res.json({ item: courseView(co, c, true), me: meView(c) });
   }));
@@ -653,7 +654,7 @@ export function createRouter(store: Store, deps: Deps) {
     const co = db().courses.find((x) => x.id === req.params.id);
     if (!co) throw notFound();
     if (co.ownerId !== c.user.id) throw forbidden();
-    sell(co);
+    sell(co, 'demo');
     store.save();
     res.json({ item: courseView(co, c, true) });
   }));
@@ -675,7 +676,7 @@ export function createRouter(store: Store, deps: Deps) {
     const cat = String(req.query.cat || 'all');
     const cond = String(req.query.cond || 'all');
     const country = String(req.query.country || '');
-    const q = String(req.query.q || '');
+    const q = String(req.query.q || '').slice(0, 200);
     const all = db().listings;
     const items = all
       .filter((l) => (cat === 'all' || l.cat === cat) && (cond === 'all' || l.cond === cond) && (!country || l.c === country))
@@ -704,13 +705,15 @@ export function createRouter(store: Store, deps: Deps) {
       cat: z.enum(['device', 'part', 'cons', 'acc']), cond: z.enum(['new', 'used', 'refurb']),
       name: z.string().trim().min(1).max(160), brand: z.string().trim().max(80).default(''), model: z.string().trim().max(120).default(''),
       year: z.number().int().min(0).max(2100).default(0), stock: z.number().int().min(1).max(1_000_000).default(1),
-      usd: z.number().positive().max(10_000_000), country: z.string().length(2), reg: z.string().trim().max(120).default(''),
+      usd: z.number().positive().max(10_000_000), country: z.string().length(2).transform((v) => v.toUpperCase()).refine((v) => COUNTRIES.includes(v)),
+      reg: z.string().trim().max(120).default(''),
       desc: z.string().trim().max(3000).default(''), declared: z.literal(true),
     }), req.body);
     const l: Listing = {
       id: 'm' + uid(), ownerId: c.user.id, cat: b.cat, cond: b.cond, tr: b.name, en: b.name, brand: b.brand, model: b.model,
-      year: b.year, stock: b.stock, usd: b.usd, c: b.country.toUpperCase(), reg: b.reg, seller: c.user.name || displayName(c),
-      ok: 1, dtr: b.desc, den: b.desc,
+      year: b.year, stock: b.stock, usd: b.usd, c: b.country, reg: b.reg, seller: displayName(c),
+      // The "verified seller" badge is granted by a developer after checking the seller's documents, never automatically.
+      ok: 0, dtr: b.desc, den: b.desc,
     };
     db().listings.unshift(l);
     store.save();
@@ -786,6 +789,8 @@ export function createRouter(store: Store, deps: Deps) {
       chunkCount: d.docs.reduce((a, x) => a + x.chunks.length, 0),
       solCount: d.sols.length,
       reports: d.reports.length,
+      pendingListings: d.listings.filter((l) => l.ownerId && !l.ok).slice(0, 100)
+        .map((l) => ({ id: l.id, title: l.tr, seller: l.seller, brand: l.brand, model: l.model })),
     });
   }));
 
@@ -808,6 +813,16 @@ export function createRouter(store: Store, deps: Deps) {
     store.reindex();
     store.save();
     res.json({ id: doc.id, chunks: doc.chunks.length });
+  }));
+
+  // A developer has checked the seller's company and device registration documents.
+  r.post('/admin/listings/:id/verify', wrap((req, res) => {
+    const l = db().listings.find((x) => x.id === req.params.id);
+    if (!l) throw notFound();
+    l.ok = 1;
+    store.save();
+    audit('admin_listing_verified', { by: req.ctx.user.id, listing: l.id });
+    res.json({ item: listingView(l, req.ctx) });
   }));
 
   // A developer has reviewed a solution the AI flagged as a safety risk and judged it safe.
@@ -852,7 +867,7 @@ export function createRouter(store: Store, deps: Deps) {
   }));
 
   r.get('/admin/search', wrap((req, res) => {
-    const q = String(req.query.q || '');
+    const q = String(req.query.q || '').slice(0, 500);
     const hits = store.index.search(q, '', 4).map((e) => (e.type === 'doc'
       ? { type: 'doc', title: e.doc.title, h: e.doc.chunks[e.ci].h, t: e.doc.chunks[e.ci].t }
       : { type: 'sol', title: '★ ' + devOf(e.sol), h: e.sol.symptom, t: e.sol.steps }));

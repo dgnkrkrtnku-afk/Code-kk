@@ -74,7 +74,11 @@ export interface HistoryItem {
 
 export interface LedgerEntry { n: number; why: string; date: string }
 export interface Quote { id: string; title: string; seller: string; usd: number; qty: number; msg: string; date: string }
-export interface Sale { courseId: string; title: string; usd: number; fee: number; sellerId: string | null; date: string }
+export interface Sale {
+  courseId: string; title: string; usd: number; fee: number; sellerId: string | null; date: string;
+  /** How the buyer paid: with points, or a demo "card" payment that moved no money. */
+  how?: 'pts' | 'card' | 'demo';
+}
 
 /** A verified Google Play subscription bound to a user. */
 export interface Subscription {
@@ -103,7 +107,7 @@ export interface User {
   ledger: LedgerEntry[];
   usage: { d: string; n: number };
   /** How many rewarded actions the user did today (see DAILY_REWARDS). */
-  earned?: { d: string; teach: number; vote: number };
+  earned?: { d: string; teach: number; vote: number; verified?: number };
   history: HistoryItem[];
   owned: string[];
   quotes: Quote[];

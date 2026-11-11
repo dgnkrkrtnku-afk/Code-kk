@@ -18,6 +18,8 @@ export const EXTRA = {
     f_saved_cap: 'Çözümün alındı. Bugünkü puan sınırına ulaştın; doğrulanınca +{0} puan kazanırsın.', v_thanks_cap: 'Oyun kaydedildi.',
     c_review: 'AI güvenlik riski işaretlediği için bu çözüm, bir geliştirici inceleyene kadar doğrulanmaz ve başkalarına önerilmez.',
     c_approve: 'İnceledim, güvenli',
+    p_unverified: 'Satıcı henüz doğrulanmadı', d_pending: 'Doğrulama bekleyen ilanlar', d_verify: 'Satıcıyı doğrula', d_none_pending: 'Bekleyen ilan yok.',
+    d_pending_d: '“Doğrulanmış satıcı” rozeti yalnızca burada onay verildiğinde görünür. Onaylamadan önce satıcının şirket ve tıbbi cihaz kayıt belgelerini kontrol edin.',
 
     // sign-in
     au_sub: 'Tıbbi cihaz arızaları için saha asistanı.',
@@ -77,6 +79,8 @@ export const EXTRA = {
     f_saved_cap: 'Solution received. You reached today’s points limit; you earn +{0} points when it is verified.', v_thanks_cap: 'Vote saved.',
     c_review: 'The AI flagged a safety risk, so this solution is not verified or suggested to others until a developer reviews it.',
     c_approve: 'Reviewed, safe',
+    p_unverified: 'Seller not verified yet', d_pending: 'Listings awaiting verification', d_verify: 'Verify seller', d_none_pending: 'No listings waiting.',
+    d_pending_d: 'The “Verified seller” badge appears only after approval here. Check the seller’s company and medical device registration documents before approving.',
 
     au_sub: 'Field assistant for medical device faults.',
     au_title_in: 'Sign in', au_title_up: 'Create account', au_email: 'E-mail', au_pass: 'Password', au_pass_hint: 'At least 8 characters',

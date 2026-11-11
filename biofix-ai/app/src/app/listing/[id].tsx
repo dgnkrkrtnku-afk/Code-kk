@@ -57,7 +57,7 @@ export default function Listing() {
       <Row style={{ marginVertical: 14, paddingTop: 9, borderTopWidth: 1, borderTopColor: c.line }}>
         <P bold style={{ flex: 1 }}>{l.seller}</P>
         {l.mine ? <Badge tone="info">{t('p_mine')}</Badge> : (
-          <>{l.ok ? <Badge tone="ok">{'✓ ' + t('p_verified')}</Badge> : null}{!l.id.startsWith('m') ? <Tag>{t('p_demo')}</Tag> : null}</>
+          <>{l.ok ? <Badge tone="ok">{'✓ ' + t('p_verified')}</Badge> : <Tag>{t('p_unverified')}</Tag>}{!l.id.startsWith('m') ? <Tag>{t('p_demo')}</Tag> : null}</>
         )}
       </Row>
 

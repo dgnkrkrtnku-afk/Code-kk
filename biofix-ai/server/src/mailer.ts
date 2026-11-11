@@ -1,7 +1,7 @@
 // Outgoing e-mail (password reset codes). Uses SMTP when SMTP_URL is set; otherwise prints to the
 // server console so the flow can be tried in development without a mail account.
 import nodemailer from 'nodemailer';
-import { isProd } from './config.js';
+import { printResetCodes } from './config.js';
 import type { Lang } from './types.js';
 
 export interface Mailer {
@@ -26,9 +26,9 @@ export function createMailer(): Mailer {
   if (!url) {
     return {
       async sendResetCode(to, code) {
-        // A reset code in a log file is as good as the password, so it is only ever printed in development.
-        if (isProd()) console.warn('Password reset requested but SMTP_URL is not set; no e-mail was sent.');
-        else console.log(`[mail disabled] password reset code for ${to}: ${code}  (set SMTP_URL to send real e-mail)`);
+        // A reset code in a log file is as good as the password: printed only when explicitly enabled for local testing.
+        if (printResetCodes()) console.log(`[PRINT_RESET_CODES] password reset code for ${to}: ${code}`);
+        else console.warn('Password reset requested but SMTP_URL is not set; no e-mail was sent. (Local testing: PRINT_RESET_CODES=true)');
       },
     };
   }

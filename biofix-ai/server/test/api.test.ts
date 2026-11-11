@@ -10,6 +10,7 @@ delete process.env.ANTHROPIC_API_KEY;
 process.env.ADMIN_TOKEN = 'test-admin-token-0123456789abcdef';
 process.env.PLAY_RTDN_SECRET = 'rtdn-secret-0123456789';
 process.env.AUDIT_LOG = 'off';
+process.env.DEMO_PAYMENTS = 'true'; // these tests exercise the demo purchase paths too
 
 /** Stand-in for Google Play: tests put purchases here and the server "verifies" against it. */
 const subs = new Map<string, PlaySubscription>();
@@ -277,8 +278,11 @@ test('demo payments can be switched off', async () => {
     const id = (await call('GET', '/courses', undefined, B)).json.items[1].id;
     assert.equal((await call('POST', `/courses/${id}/buy`, { how: 'card' }, B)).json.error, 'use_points');
     assert.equal((await call('GET', '/me', undefined, B)).json.demoPayments, false);
+    // Without demo mode points are worth money, so a new account starts with none.
+    const fresh = await register('nodemo@example.com', 'No Demo');
+    assert.equal(fresh.json.me.user.points, 0);
   } finally {
-    delete process.env.DEMO_PAYMENTS;
+    process.env.DEMO_PAYMENTS = 'true';
   }
   const demo = await call('POST', '/billing/demo/points', { productId: 'biofix_points_500' }, B);
   assert.equal(demo.json.credited, 500);

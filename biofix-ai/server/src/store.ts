@@ -201,15 +201,16 @@ export class Store {
   }
 
   /**
-   * Points for teaching or voting, limited per day so they can't be farmed.
+   * Points for teaching, voting or having a solution verified, limited per day so they can't be farmed.
    * Returns the points given (0 once today's limit is reached).
    */
   reward(u: User, kind: keyof typeof DAILY_REWARDS): number {
     const today = todayKey();
-    if (!u.earned || u.earned.d !== today) u.earned = { d: today, teach: 0, vote: 0 };
-    if (u.earned[kind] >= DAILY_REWARDS[kind]) return 0;
-    u.earned[kind]++;
-    this.award(u, PT[kind], kind === 'teach' ? 'pt_teach' : 'pt_vote');
+    if (!u.earned || u.earned.d !== today) u.earned = { d: today, teach: 0, vote: 0, verified: 0 };
+    const done = u.earned[kind] ?? 0;
+    if (done >= DAILY_REWARDS[kind]) return 0;
+    u.earned[kind] = done + 1;
+    this.award(u, PT[kind], `pt_${kind}`);
     return PT[kind];
   }
 }

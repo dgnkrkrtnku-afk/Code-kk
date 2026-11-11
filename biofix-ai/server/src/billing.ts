@@ -95,6 +95,14 @@ export class Billing {
       console.warn('Play subscription check failed:', e instanceof Error ? e.message : e);
       return;
     }
+    if (!s && Date.parse(sub.expiresAt) > now) {
+      // Google doesn't recognise a token that is still inside its paid period. That points at our own
+      // configuration (wrong package name or service account), not at the customer: keep access.
+      console.warn('Play does not recognise an active subscription token; check GOOGLE_PLAY_PACKAGE and the service account.');
+      sub.checkedAt = new Date(now).toISOString();
+      this.store.save();
+      return;
+    }
     const plan = s ? planOfProduct(s.productId) : undefined;
     if (s && plan && entitled(s, now)) this.applySub(u, s, sub.token, plan, now);
     else this.setFree(u);

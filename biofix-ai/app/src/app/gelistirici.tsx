@@ -71,6 +71,14 @@ export default function Developer() {
     } catch (e) { toast(errText(e)); }
   }
 
+  async function verify(id: string) {
+    try {
+      await api.post(`/admin/listings/${id}/verify`);
+      bump();
+      reload();
+    } catch (e) { toast(errText(e)); }
+  }
+
   async function setFee(fee: number) {
     try {
       await api.patch('/admin/fee', { fee });
@@ -136,6 +144,19 @@ export default function Developer() {
           </Row>
         </Card>
       ))}
+
+      <H2>{t('d_pending')}</H2>
+      {data.pendingListings.length ? data.pendingListings.map((l) => (
+        <Card key={l.id}>
+          <P bold>{l.title}</P>
+          <P small muted>{`${l.seller} · ${l.brand} ${l.model}`.trim()}</P>
+          <Row style={{ marginTop: 8 }}>
+            <Btn sm kind="sec" title={t('h_open')} onPress={() => router.push({ pathname: '/listing/[id]', params: { id: l.id } })} />
+            <Btn sm title={t('d_verify')} onPress={() => verify(l.id)} />
+          </Row>
+        </Card>
+      )) : <P small muted>{t('d_none_pending')}</P>}
+      <Note>{t('d_pending_d')}</Note>
 
       <H2>{t('k_test')}</H2>
       <Card>

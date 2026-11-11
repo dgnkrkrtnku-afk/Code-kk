@@ -8,13 +8,14 @@ import { createRouter, errorHandler, type Deps } from './routes.js';
 import { parseDataKey, Store } from './store.js';
 
 /** Routes that accept large bodies (photos, manuals). Their parser runs after sign-in, inside the router. */
-const LARGE_BODY = new Set(['/api/diagnose', '/api/solutions', '/api/admin/docs', '/api/admin/extract-pdf', '/api/admin/ocr']);
+const LARGE_BODY = new Set(['/api/diagnose', '/api/solutions', '/api/courses', '/api/admin/docs', '/api/admin/extract-pdf', '/api/admin/ocr']);
 
 export function createApp(store: Store, deps: Deps) {
   const app = express();
   app.disable('x-powered-by');
   // Behind a reverse proxy (nginx, Render, Fly…) set TRUST_PROXY=1 so rate limits and HTTPS detection see the real client.
-  if (process.env.TRUST_PROXY) app.set('trust proxy', Number(process.env.TRUST_PROXY) || true);
+  // The value is the number of proxies in front (usually 1). Trusting more would let clients fake their address.
+  if (process.env.TRUST_PROXY) app.set('trust proxy', Number(process.env.TRUST_PROXY) || 1);
 
   // Security headers. The API only ever returns JSON, so nothing may be framed, sniffed, cached or embedded.
   app.use((req, res, next) => {

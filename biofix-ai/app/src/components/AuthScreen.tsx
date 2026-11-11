@@ -87,7 +87,10 @@ export function AuthScreen() {
         <Card>
           {info ? <P small style={{ marginBottom: 12 }}>{info}</P> : null}
           {mode === 'register' ? (
-            <Input label={t('au_name')} value={name} onChangeText={setName} autoComplete="name" textContentType="name" maxLength={40} />
+            <>
+              <Input label={t('au_name')} value={name} onChangeText={setName} autoComplete="name" textContentType="name" maxLength={40} />
+              <P small muted style={{ marginTop: -6, marginBottom: 12 }}>{t('au_name_hint')}</P>
+            </>
           ) : null}
           <Input
             label={t('au_email')} value={email} onChangeText={setEmail} keyboardType="email-address" inputMode="email"

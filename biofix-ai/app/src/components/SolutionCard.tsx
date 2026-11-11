@@ -61,7 +61,8 @@ export function SolutionCard({ s, open, onChange, onDelete }: {
       <Details link title={t('c_show')} defaultOpen={open}>
         <P selectable>{s.steps}</P>
         {s.part ? <P small style={{ marginTop: 8 }}><Text style={{ fontWeight: '700' }}>{t('c_part')}: </Text>{s.part}</P> : null}
-        {s.photo ? <Image source={{ uri: s.photo }} style={{ width: '100%', aspectRatio: 4 / 3, borderRadius: 10, marginTop: 8 }} resizeMode="cover" /> : null}
+        {/* Only inline image data is ever shown, never a remote address. */}
+        {s.photo.startsWith('data:image/') ? <Image source={{ uri: s.photo }} style={{ width: '100%', aspectRatio: 4 / 3, borderRadius: 10, marginTop: 8 }} resizeMode="cover" /> : null}
         {s.photoNote ? <P small muted style={{ marginTop: 6 }}>{'📷 ' + s.photoNote}</P> : null}
       </Details>
       <P small muted mono style={{ marginTop: 9 }}>{t('c_votes', s.ok, s.fail)}</P>

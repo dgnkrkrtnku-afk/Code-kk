@@ -90,6 +90,8 @@ export interface AdminOverview {
   totalSales: number; totalFee: number;
   docs: { id: string; title: string; brand: string; model: string; kind: 'sample' | 'manual'; chunks: number }[];
   chunkCount: number; solCount: number; reports: number;
+  /** User listings waiting for the seller to be verified. */
+  pendingListings: { id: string; title: string; seller: string; brand: string; model: string }[];
 }
 
 export interface ImagePayload { data: string; mediaType: 'image/jpeg'; uri: string }
