@@ -1,31 +1,33 @@
 import { router } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Image, Pressable, Text, View } from 'react-native';
+import { ActivityIndicator, Image, Pressable, ScrollView, Text, View } from 'react-native';
 import { Icon } from '../../components/icons';
-import { SolutionCard } from '../../components/SolutionCard';
-import {
-  Badge, Btn, Card, Details, Empty, H1, H2, Input, P, Row, Screen, Select, Sub, Tag, WarnBox, type Tone,
-} from '../../components/ui';
+import { CodeCards, QuickResults } from '../../components/QuickResults';
+import { Report, TeachCta } from '../../components/Report';
+import { Btn, Card, H1, H2, Input, P, Row, Screen, Select, Sub, Tag, WarnBox } from '../../components/ui';
+import { qs } from '../../lib/api';
 import { unlimited, useApp } from '../../lib/app-context';
-import { pickImage } from '../../lib/media';
+import { pickAttachment, pickImage, pickImages } from '../../lib/media';
 import { MONO } from '../../lib/theme';
-import type { HistoryItem, ImagePayload, Level, SolutionView, Source } from '../../lib/types';
-import { setPendingMarketQuery } from '../../lib/market-query';
+import type { DeviceLabel, Diagnosis, FilePayload, HistoryItem, ImagePayload, Quick, QuickList } from '../../lib/types';
 
-const LVL: Record<Level, [Tone, string, string]> = {
-  high: ['ok', 'c_high', '●●●'], medium: ['warn', 'c_mid', '●●○'], low: ['bad', 'c_low', '●○○'],
-};
+const MAX_PHOTOS = 4;
 
 export default function Assistant() {
   const { c, t, api, me, refreshMe, errText, toast } = useApp();
   const [devices, setDevices] = useState<string[]>([]);
   const [dev, setDev] = useState('');
   const [q, setQ] = useState('');
-  const [photo, setPhoto] = useState<ImagePayload | null>(null);
+  const [photos, setPhotos] = useState<ImagePayload[]>([]);
+  const [file, setFile] = useState<FilePayload | null>(null);
   const [busy, setBusy] = useState(false);
+  const [scanning, setScanning] = useState(false);
   const [err, setErr] = useState('');
-  const [cur, setCur] = useState<HistoryItem | null>(null);
-  const [offline, setOffline] = useState<{ docs: Source[]; sols: SolutionView[] } | null>(null);
+  const [quick, setQuick] = useState<Quick | null>(null);     // instant matches, before any AI
+  const [partial, setPartial] = useState<Diagnosis | null>(null); // the AI answer while it is being written
+  const [cur, setCur] = useState<HistoryItem | null>(null);   // the finished, saved diagnosis
+  const [aiOff, setAiOff] = useState(false);                   // the answer was instant results only
+  const [shortcuts, setShortcuts] = useState<QuickList | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const ctl = useRef<AbortController | null>(null);
 
@@ -34,47 +36,110 @@ export default function Assistant() {
       const [d, h] = await Promise.all([api.get<{ devices: string[] }>('/devices'), api.get<{ items: HistoryItem[] }>('/history')]);
       setDevices(d.devices);
       setHistory(h.items);
-    } catch { /* status line shows connection problems */ }
+    } catch { /* the status line shows connection problems */ }
   }, [api]);
   useEffect(() => { load(); }, [load, me?.user.id]);
+
+  // Shortcuts for the selected device: faults others solved on it, and its error codes.
+  useEffect(() => {
+    setShortcuts(null);
+    if (!dev) return;
+    let alive = true;
+    api.get<QuickList>('/quick' + qs({ dev })).then((r) => { if (alive) setShortcuts(r); }).catch(() => {});
+    return () => { alive = false; };
+  }, [api, dev]);
 
   const plan = me?.plan;
   const status = !me
     ? { dot: c.muted, text: t('a_ai_wait') }
     : me.ai ? { dot: c.ok, text: t('a_ai_ok') } : { dot: c.warn, text: t('a_ai_none') };
+  /** Photos and files are read by the AI, on plans that include it. */
+  const canAttach = () => {
+    if (plan?.photo) return true;
+    toast(t('e_photo_plan'));
+    return false;
+  };
 
-  async function addPhoto(src: 'camera' | 'library') {
+  async function addPhotos(src: 'camera' | 'library') {
+    if (!canAttach()) return;
+    const room = MAX_PHOTOS - photos.length;
+    if (room <= 0) { toast(t('a_photos_max')); return; }
     try {
-      const p = await pickImage(src);
-      if (p === 'denied') toast(t('e_perm'));
-      else if (p) setPhoto(p);
+      const got = src === 'camera' ? await pickImage('camera') : await pickImages(room);
+      if (got === 'denied') toast(t('e_perm'));
+      else if (got) setPhotos((p) => [...p, ...(Array.isArray(got) ? got : [got])].slice(0, MAX_PHOTOS));
     } catch (e) {
       toast(errText(e));
     }
   }
 
-  async function solve() {
-    setErr(''); setOffline(null);
-    if (!q.trim() && !photo) { toast(t('a_need')); return; }
+  async function addFile() {
+    if (!canAttach()) return;
+    try {
+      const f = await pickAttachment();
+      if (f === 'too_big') toast(t('a_file_big'));
+      else if (f) setFile(f);
+    } catch (e) {
+      toast(errText(e));
+    }
+  }
+
+  /** Photograph the device label and let the AI pick the device, instead of scrolling through the list. */
+  async function scanLabel() {
+    try {
+      const img = await pickImage('camera', 1600);
+      if (img === 'denied') { toast(t('e_perm')); return; }
+      if (!img) return;
+      setScanning(true);
+      const r = await api.post<DeviceLabel>('/identify-device', { image: { data: img.data, mediaType: img.mediaType } });
+      if (r.device) { setDev(r.device); toast(t('a_label_ok', r.device)); }
+      else if (r.label) { setDev(r.label); toast(t('a_label_new', r.label)); }
+      else toast(t('a_label_none'));
+    } catch (e) {
+      toast(errText(e));
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  async function solve(text = q) {
+    setErr('');
+    if (!text.trim() && !photos.length && !file) { toast(t('a_need')); return; }
     if (me?.ai && plan && !unlimited(plan.quota) && me.user.usedToday >= plan.quota) { setErr(t('a_limit')); return; }
-    setBusy(true); setCur(null);
+    setBusy(true); setQuick(null); setPartial(null); setCur(null); setAiOff(false);
     ctl.current = new AbortController();
     try {
-      const r = await api.post<{ item?: HistoryItem; offline?: { docs: Source[]; sols: SolutionView[] } }>(
-        '/diagnose', { q, dev, image: photo ? { data: photo.data, mediaType: photo.mediaType } : null }, ctl.current.signal,
-      );
-      if (r.offline) setOffline(r.offline);
-      if (r.item) { setCur(r.item); setHistory((h) => [r.item!, ...h.filter((x) => x.id !== r.item!.id)]); }
+      await api.stream('/diagnose', {
+        q: text, dev,
+        images: photos.map((p) => ({ data: p.data, mediaType: p.mediaType })),
+        file,
+      }, (e) => {
+        if (e.type === 'quick') setQuick(e.quick);
+        else if (e.type === 'partial') setPartial(e.res);
+        else if (e.type === 'done') {
+          setPartial(null);
+          if (e.item) { const item = e.item; setCur(item); setHistory((h) => [item, ...h.filter((x) => x.id !== item.id)]); }
+          else setAiOff(true);
+        }
+      }, ctl.current.signal);
       refreshMe();
     } catch (e) {
       const code = (e as { code?: string }).code;
+      setPartial(null);
       if (code !== 'cancelled') setErr(code === 'quota' ? t('a_limit') : errText(e));
     } finally {
       setBusy(false); ctl.current = null;
     }
   }
 
+  /** A shortcut chip: fill in the fault and look it up straight away. */
+  const run = (text: string) => { setQ(text); void solve(text); };
   const teachFrom = () => router.push({ pathname: '/teach', params: { dev, q } });
+  const deviceOptions = [
+    { value: '', label: t('a_dev_any') },
+    ...[...new Set([...devices, ...(dev ? [dev] : [])])].map((d) => ({ value: d, label: d })),
+  ];
+  const chip = { borderColor: c.line, borderWidth: 1, backgroundColor: c.surface, borderRadius: 999, paddingVertical: 7, paddingHorizontal: 12 } as const;
 
   return (
     <Screen>
@@ -91,43 +156,104 @@ export default function Assistant() {
       </Row>
 
       <Card>
-        <Select
-          label={t('a_dev')}
-          value={dev}
-          onChange={setDev}
-          options={[{ value: '', label: t('a_dev_any') }, ...devices.map((d) => ({ value: d, label: d }))]}
-        />
+        <Row style={{ alignItems: 'flex-end' }}>
+          <Select half label={t('a_dev')} value={dev} onChange={setDev} options={deviceOptions} />
+          {me?.ai ? (
+            <Btn kind="sec" busy={scanning} title={t('a_label')} icon={scanning ? null : <Icon name="cam" color={c.ink} size={17} />} onPress={scanLabel} style={{ marginBottom: 12 }} />
+          ) : null}
+        </Row>
+
+        {shortcuts && (shortcuts.faults.length || shortcuts.codes.length) ? (
+          <View style={{ marginBottom: 12 }}>
+            {shortcuts.faults.length ? (
+              <>
+                <P small muted style={{ marginBottom: 6 }}>{t('a_solved')}</P>
+                <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 7, marginBottom: shortcuts.codes.length ? 10 : 0 }}>
+                  {shortcuts.faults.map((f) => (
+                    <Pressable key={f.id} accessibilityRole="button" disabled={busy} onPress={() => run(f.symptom)} style={[chip, { maxWidth: '100%' }]}>
+                      <Text style={{ color: c.ink, fontSize: 12.5, fontWeight: '600' }} numberOfLines={2}>
+                        {f.status === 'ver' ? <Text style={{ color: c.ok }}>✓ </Text> : null}{f.symptom}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+              </>
+            ) : null}
+            {shortcuts.codes.length ? (
+              <>
+                <P small muted style={{ marginBottom: 6 }}>{t('a_codes')}</P>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 7 }}>
+                  {shortcuts.codes.map((k) => (
+                    <Pressable key={k.code} accessibilityRole="button" accessibilityLabel={`${k.code}: ${k.text}`} disabled={busy} onPress={() => run(k.code)} style={chip}>
+                      <Text style={{ color: c.cyan, fontFamily: MONO, fontWeight: '700', fontSize: 12.5 }}>{k.code}</Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+              </>
+            ) : null}
+          </View>
+        ) : null}
+
         <Input label={t('a_q')} value={q} onChangeText={setQ} placeholder={t('a_q_ph')} multiline />
-        {photo ? (
-          <Row style={{ backgroundColor: c.sunk, borderRadius: 9, padding: 7, marginBottom: 10 }}>
-            <Image source={{ uri: photo.uri }} style={{ width: 38, height: 38, borderRadius: 6 }} />
-            <P small style={{ flex: 1 }}>📷 {t('f_photo_ok')}</P>
-            <Btn kind="ghost" sm title={t('rm')} onPress={() => setPhoto(null)} />
+
+        {photos.length || file ? (
+          <View style={{ marginBottom: 10 }}>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+              {photos.map((p, i) => (
+                <Pressable key={p.uri + i} accessibilityRole="button" accessibilityLabel={t('rm')} onPress={() => setPhotos((all) => all.filter((_, j) => j !== i))}>
+                  <Image source={{ uri: p.uri }} style={{ width: 58, height: 58, borderRadius: 8 }} />
+                  <View style={{ position: 'absolute', top: -5, right: -5, width: 20, height: 20, borderRadius: 10, backgroundColor: c.ink, alignItems: 'center', justifyContent: 'center' }}>
+                    <Text style={{ color: c.bg, fontSize: 12, fontWeight: '800' }}>×</Text>
+                  </View>
+                </Pressable>
+              ))}
+            </View>
+            {file ? (
+              <Row style={{ backgroundColor: c.sunk, borderRadius: 9, paddingVertical: 6, paddingHorizontal: 10, marginTop: photos.length ? 8 : 0 }}>
+                <P small style={{ flex: 1 }}>{'📎 ' + file.name}</P>
+                <Btn kind="ghost" sm title={t('rm')} onPress={() => setFile(null)} />
+              </Row>
+            ) : null}
+            <P small muted style={{ marginTop: 8 }}>{t('a_photo_privacy')}</P>
+          </View>
+        ) : null}
+
+        {me?.ai ? (
+          <Row wrap style={{ marginBottom: 10 }}>
+            <Btn kind="sec" sm title={t('camera')} icon={<Icon name="cam" color={c.ink} size={16} />} onPress={() => addPhotos('camera')} />
+            <Btn kind="sec" sm title={t('a_photo')} onPress={() => addPhotos('library')} />
+            <Btn kind="sec" sm title={t('a_file')} onPress={addFile} />
           </Row>
         ) : null}
-        {photo ? <P small muted style={{ marginBottom: 10 }}>{t('a_photo_privacy')}</P> : null}
-        <Row>
-          {!photo && me?.ai && plan?.photo ? (
-            <>
-              <Btn kind="sec" title="" icon={<Icon name="cam" color={c.ink} size={18} />} onPress={() => addPhoto('camera')} />
-              <Btn kind="sec" title={t('a_photo')} onPress={() => addPhoto('library')} />
-            </>
-          ) : null}
-          {busy
-            ? <Btn kind="sec" title={t('a_stop')} style={{ flex: 1 }} onPress={() => ctl.current?.abort()} />
-            : <Btn title={t('a_go')} style={{ flex: 1 }} onPress={solve} />}
-        </Row>
+        {busy
+          ? <Btn kind="sec" full title={t('a_stop')} onPress={() => ctl.current?.abort()} />
+          : <Btn full title={t('a_go')} onPress={() => solve()} />}
       </Card>
 
-      {busy ? (
+      {err ? <WarnBox>{err}</WarnBox> : null}
+
+      {/* 1. Instant: what the manuals and other technicians already say. */}
+      {busy && !quick ? (
+        <Card accent={c.cyan}><Row><ActivityIndicator size="small" color={c.cyan} /><P bold>{t('loading')}</P></Row></Card>
+      ) : null}
+      {quick && (busy || aiOff) ? (
+        <>
+          <H2 style={{ marginTop: 6 }}>{t('a_quick')}</H2>
+          <QuickResults quick={quick} full={aiOff} />
+          {aiOff ? <TeachCta onTeach={teachFrom} /> : null}
+        </>
+      ) : null}
+      {quick && cur && quick.codes.length ? <CodeCards codes={quick.codes} /> : null}
+
+      {/* 2. The AI diagnosis, shown while it is written and then as the saved record. */}
+      {busy && quick && !partial && me?.ai ? (
         <Card accent={c.cyan}>
-          <Row><ActivityIndicator size="small" color={c.cyan} /><P bold>{t('loading')}</P></Row>
+          <Row><ActivityIndicator size="small" color={c.cyan} /><P bold>{t('a_ai_writing')}</P></Row>
           <P small muted style={{ marginTop: 6 }}>{t('a_long')}</P>
         </Card>
       ) : null}
-      {err ? <WarnBox>{err}</WarnBox> : null}
-      {offline ? <OfflineResult o={offline} onTeach={teachFrom} /> : null}
-      {cur ? <Report x={cur} onChange={setCur} onTeach={teachFrom} /> : null}
+      {partial && !cur ? <Report x={null} res={partial} dev={dev} onChange={setCur} onTeach={teachFrom} /> : null}
+      {cur ? <Report x={cur} res={cur.res} dev={cur.dev} onChange={setCur} onTeach={teachFrom} /> : null}
 
       {history.length ? (
         <>
@@ -136,11 +262,14 @@ export default function Assistant() {
             {history.slice(0, 8).map((x, i) => (
               <Pressable
                 key={x.id}
-                onPress={() => { setCur(x); setQ(x.q); setDev(x.dev); setErr(''); setOffline(null); }}
+                onPress={() => {
+                  setCur(x); setQ(x.q); setDev(x.dev); setErr(''); setPartial(null); setAiOff(false);
+                  setQuick(x.codes?.length ? { codes: x.codes, sols: [], docs: [] } : null);
+                }}
                 style={{ flexDirection: 'row', gap: 10, alignItems: 'center', paddingVertical: 11, borderBottomWidth: i === Math.min(history.length, 8) - 1 ? 0 : 1, borderBottomColor: c.line }}
               >
                 <View style={{ flex: 1 }}>
-                  <P bold style={{ fontSize: 13.5 }} >{x.q.slice(0, 70) || '📷'}</P>
+                  <P bold style={{ fontSize: 13.5 }}>{x.q.slice(0, 70) || '📎'}</P>
                   {x.dev ? <P small muted>{x.dev}</P> : null}
                 </View>
                 <Tag>{x.date}</Tag>
@@ -150,168 +279,5 @@ export default function Assistant() {
         </>
       ) : null}
     </Screen>
-  );
-}
-
-function TeachCta({ onTeach }: { onTeach: () => void }) {
-  const { t, me } = useApp();
-  return (
-    <Card>
-      <P bold>{t('r_teach_t')}</P>
-      <P small muted style={{ marginTop: 4, marginBottom: 10 }}>{t('r_teach_d')}</P>
-      <Btn full title={`${t('r_teach_b')}  +${me?.pt.teach ?? 20}`} onPress={onTeach} />
-    </Card>
-  );
-}
-
-function SourceBox({ title, h, text, n }: { title: string; h: string; text: string; n?: number }) {
-  const { c } = useApp();
-  return (
-    <Details title={<Text>{n ? <Text style={{ color: c.cyan, fontFamily: MONO }}>{`[${n}] `}</Text> : null}{title}{h ? ` / ${h}` : ''}</Text>}>
-      <P small muted selectable>{text}</P>
-    </Details>
-  );
-}
-
-function OfflineResult({ o, onTeach }: { o: { docs: Source[]; sols: SolutionView[] }; onTeach: () => void }) {
-  const { t } = useApp();
-  if (!o.docs.length && !o.sols.length) return <><Empty>{t('off_none')}</Empty><TeachCta onTeach={onTeach} /></>;
-  return (
-    <>
-      {o.sols.length ? <><H2>{t('r_comm')}</H2>{o.sols.map((s) => <SolutionCard key={s.id} s={s} open />)}</> : null}
-      {o.docs.length ? <><H2>{t('off_sec')}</H2>{o.docs.map((d, i) => <SourceBox key={i} title={d.title} h={d.h} text={d.t} />)}</> : null}
-      <TeachCta onTeach={onTeach} />
-    </>
-  );
-}
-
-/** The diagnosis "work order" (föy). */
-function Report({ x, onChange, onTeach }: { x: HistoryItem; onChange: (x: HistoryItem) => void; onTeach: () => void }) {
-  const { c, t, api, me, errText } = useApp();
-  const [fq, setFq] = useState('');
-  const [fBusy, setFBusy] = useState(false);
-  const [fErr, setFErr] = useState('');
-  const r = x.res;
-  const ref = (n: number | null) => (n && x.srcs[n - 1] ? <Text style={{ fontFamily: MONO, fontSize: 11, color: c.cyan }}>{` [${n}]`}</Text> : null);
-
-  function toggleStep(i: number) {
-    const done = !x.done[i];
-    onChange({ ...x, done: { ...x.done, [i]: done } });
-    api.patch(`/history/${x.id}/steps`, { i, done }).catch(() => {});
-  }
-
-  async function ask() {
-    const q = fq.trim();
-    if (!q || fBusy) return;
-    setFBusy(true); setFErr('');
-    try {
-      const res = await api.post<{ item: HistoryItem }>(`/history/${x.id}/follow-up`, { q });
-      onChange(res.item);
-      setFq('');
-    } catch (e) {
-      setFErr(errText(e));
-    } finally {
-      setFBusy(false);
-    }
-  }
-
-  function findPart(name: string) {
-    setPendingMarketQuery(name);
-    router.push('/pazar');
-  }
-
-  const H3 = ({ children }: { children: string }) => (
-    <Text style={{ fontSize: 13.5, fontWeight: '700', color: c.ink, marginTop: 18, marginBottom: 8, paddingTop: 14, borderTopWidth: 1, borderTopColor: c.line }}>{children}</Text>
-  );
-
-  return (
-    <>
-      <View style={{ backgroundColor: c.surface, borderColor: c.line, borderWidth: 1, borderRadius: 14, overflow: 'hidden', marginBottom: 14 }}>
-        <View style={{ backgroundColor: c.navy, padding: 13 }}>
-          <Text style={{ color: c.onNavy, fontWeight: '700', fontSize: 14.5 }}>{x.dev || t('a_dev_any')}</Text>
-          <Text style={{ color: c.onNavy, opacity: 0.85, fontFamily: MONO, fontSize: 11.5, marginTop: 2 }}>{`${x.date}  #${x.id.slice(-5).toUpperCase()}`}</Text>
-        </View>
-        <View style={{ padding: 14 }}>
-          <Row wrap>
-            <Badge tone={LVL[r.confidence][0]}>{`${LVL[r.confidence][2]} ${t('r_conf')}: ${t(LVL[r.confidence][1])}`}</Badge>
-            {r.grounded ? <Badge tone="info">{'✓ ' + t('r_grounded')}</Badge> : <Badge tone="warn">{'⚠ ' + t('r_generic')}</Badge>}
-          </Row>
-          <P style={{ fontSize: 15, marginTop: 10, lineHeight: 22 }}>{r.summary}</P>
-
-          {r.causes.length ? <H3>{t('r_causes')}</H3> : null}
-          {r.causes.map((cs, i) => (
-            <Row key={i} style={{ alignItems: 'flex-start', marginBottom: 9 }} gap={10}>
-              <Badge tone={LVL[cs.likelihood][0]}>{LVL[cs.likelihood][2]}</Badge>
-              <View style={{ flex: 1 }}><P bold>{cs.title}</P><P small muted>{cs.why}</P></View>
-            </Row>
-          ))}
-
-          {r.steps.length ? <H3>{t('r_steps')}</H3> : null}
-          {r.steps.map((s, i) => {
-            const done = !!x.done[i];
-            return (
-              <View key={i} style={{ flexDirection: 'row', gap: 11, paddingVertical: 10, borderBottomWidth: i === r.steps.length - 1 ? 0 : 1, borderBottomColor: c.line }}>
-                <Pressable
-                  accessibilityRole="checkbox" accessibilityState={{ checked: done }} accessibilityLabel={String(i + 1)}
-                  onPress={() => toggleStep(i)}
-                  style={{ width: 30, height: 30, borderRadius: 8, borderWidth: 1.5, borderColor: done ? c.ok : c.line, backgroundColor: done ? c.ok : c.surface, alignItems: 'center', justifyContent: 'center' }}
-                >
-                  <Text style={{ fontFamily: MONO, fontWeight: '700', fontSize: 12.5, color: done ? c.surface : c.ink }}>{done ? '✓' : i + 1}</Text>
-                </Pressable>
-                <View style={{ flex: 1 }}>
-                  <Text style={{ fontWeight: '600', fontSize: 14, color: done ? c.muted : c.ink, textDecorationLine: done ? 'line-through' : 'none' }}>{s.title}{ref(s.source)}</Text>
-                  {s.detail ? <P small muted style={{ marginTop: 2 }}>{s.detail}</P> : null}
-                  {s.measure ? (
-                    <View style={{ marginTop: 6, backgroundColor: c.sunk, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3, alignSelf: 'flex-start' }}>
-                      <Text style={{ fontFamily: MONO, fontSize: 12, color: c.ink }}>{`${t('r_meas')}: ${s.measure}`}</Text>
-                    </View>
-                  ) : null}
-                </View>
-              </View>
-            );
-          })}
-
-          <H3>{t('r_parts')}</H3>
-          {r.parts.length ? r.parts.map((p, i) => (
-            <Row key={i} style={{ alignItems: 'flex-start', paddingVertical: 10, borderBottomWidth: i === r.parts.length - 1 ? 0 : 1, borderBottomColor: c.line }} gap={10}>
-              <Badge tone={p.action === 'replace' ? 'bad' : 'info'}>{p.action === 'replace' ? '⟳ ' + t('r_replace') : '◎ ' + t('r_check')}</Badge>
-              <View style={{ flex: 1, gap: 3 }}>
-                <Text style={{ fontWeight: '700', fontSize: 14, color: c.ink }}>{p.name}{ref(p.source)}</Text>
-                {p.code ? <Tag>{p.code}</Tag> : null}
-                {p.note ? <P small muted>{p.note}</P> : null}
-                <Btn kind="ghost" sm title={t('r_find')} style={{ alignSelf: 'flex-start', paddingHorizontal: 0 }} onPress={() => findPart(p.name)} />
-              </View>
-            </Row>
-          )) : <P small muted>{t('r_none_parts')}</P>}
-
-          {r.warnings.length ? <H3>{t('r_warn')}</H3> : null}
-          {r.warnings.map((w, i) => <WarnBox key={i}>{w}</WarnBox>)}
-
-          {x.sols.length ? <H3>{t('r_comm')}</H3> : null}
-          {x.sols.map((s) => <SolutionCard key={s.id} s={s} />)}
-
-          {x.srcs.length ? <H3>{t('r_src')}</H3> : null}
-          {x.srcs.map((s, i) => <SourceBox key={i} n={i + 1} title={s.title} h={s.h} text={s.t} />)}
-
-          {me?.ai ? (
-            <>
-              <H3>{t('r_follow')}</H3>
-              <Row style={{ alignItems: 'flex-start' }}>
-                <Input half value={fq} onChangeText={setFq} placeholder={t('r_follow_ph')} onSubmitEditing={ask} returnKeyType="send" />
-                <Btn title={t('r_ask')} busy={fBusy} onPress={ask} />
-              </Row>
-              {fErr ? <WarnBox>{fErr}</WarnBox> : null}
-              {x.follow.map((f, i) => (
-                <View key={i} style={{ backgroundColor: c.sunk, borderRadius: 10, padding: 11, marginTop: 10 }}>
-                  <P bold>{f.q}</P>
-                  <P selectable style={{ marginTop: 4 }}>{f.a}</P>
-                </View>
-              ))}
-            </>
-          ) : null}
-        </View>
-      </View>
-      <TeachCta onTeach={onTeach} />
-    </>
   );
 }

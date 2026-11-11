@@ -1,4 +1,7 @@
+import { fetch as expoFetch } from 'expo/fetch';
+import { Platform } from 'react-native';
 import type { Lang } from '../i18n';
+import type { StreamEvent } from './types';
 
 export interface ApiConfig {
   baseUrl: string;
@@ -30,7 +33,8 @@ export const ERROR_KEY: Record<string, string> = {
   purchase_invalid: 'b_e_invalid', purchase_in_use: 'b_e_in_use', purchase_pending: 'b_e_pending',
   purchase_inactive: 'b_e_inactive', play_unavailable: 'b_e_unavailable', store_error: 'b_e_store', no_product: 'b_e_no_product',
   // abuse limits
-  slow_down: 'e_slow', not_image: 'e_not_image',
+  slow_down: 'e_slow', not_image: 'e_not_image', file_unreadable: 'e_file_unreadable', file_too_long: 'e_file_long',
+  job_failed: 'k_job_failed',
 };
 
 /** Plain http is acceptable only for a server on this machine (development). */
@@ -62,7 +66,76 @@ export function createApi(cfg: () => ApiConfig) {
     }
     return json as T;
   }
+
+  /**
+   * POST whose answer arrives one JSON object per line while the server is still working
+   * (instant results first, then the AI answer as it is written). `onEvent` is called for each line.
+   * Resolves when the answer is complete; rejects with ApiError like the other calls.
+   */
+  async function stream(path: string, body: unknown, onEvent: (e: StreamEvent) => void, signal?: AbortSignal): Promise<void> {
+    const c = cfg();
+    if (!__DEV__ && !/^https:\/\//i.test(c.baseUrl) && !LOOPBACK.test(c.baseUrl)) throw new ApiError('insecure_url');
+    const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'application/x-ndjson', 'x-lang': c.lang };
+    if (c.token) headers.authorization = `Bearer ${c.token}`;
+    if (c.adminToken) headers['x-admin-token'] = c.adminToken;
+    const fail = () => new ApiError(signal?.aborted ? 'cancelled' : 'network');
+    // React Native's own fetch only hands over a finished response; Expo's can be read while it arrives.
+    const doFetch = (Platform.OS === 'web' ? fetch : expoFetch) as typeof fetch;
+    let res: Response;
+    try {
+      res = await doFetch(c.baseUrl.replace(/\/+$/, '') + '/api' + path, { method: 'POST', headers, body: JSON.stringify(body), signal });
+    } catch {
+      throw fail();
+    }
+    if (!res.ok) {
+      let code = 'generic';
+      try { code = ((await res.json()) as { error?: string }).error || 'generic'; } catch { /* no body */ }
+      if (res.status === 401 && code === 'no_session' && c.token) c.onUnauthorized();
+      throw new ApiError(code, res.status);
+    }
+
+    let finished = false;
+    const handle = (line: string) => {
+      if (!line.trim()) return;
+      const e = JSON.parse(line) as StreamEvent;
+      if (e.type === 'error') throw new ApiError(e.error || 'generic');
+      if (e.type === 'done') finished = true;
+      if (e.type !== 'ping') onEvent(e);
+    };
+    try {
+      const reader = res.body?.getReader();
+      if (!reader) {
+        (await res.text()).split('\n').forEach(handle); // no streaming here: process the whole answer at once
+      } else {
+        // Lines are cut on the newline byte before decoding, so a character split across two network
+        // packets (every Turkish letter is two bytes) is never decoded in halves.
+        const decoder = new TextDecoder();
+        let buf = new Uint8Array(0);
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (value?.length) {
+            const next = new Uint8Array(buf.length + value.length);
+            next.set(buf);
+            next.set(value, buf.length);
+            buf = next;
+            for (let nl = buf.indexOf(10); nl >= 0; nl = buf.indexOf(10)) {
+              handle(decoder.decode(buf.subarray(0, nl)));
+              buf = buf.subarray(nl + 1);
+            }
+          }
+          if (done) break;
+        }
+        if (buf.length) handle(decoder.decode(buf));
+      }
+    } catch (e) {
+      if (e instanceof ApiError) throw e;
+      throw fail();
+    }
+    if (!finished) throw fail(); // the connection dropped before the answer was complete
+  }
+
   return {
+    stream,
     get: <T>(p: string, signal?: AbortSignal) => req<T>('GET', p, undefined, signal),
     post: <T>(p: string, b?: unknown, signal?: AbortSignal) => req<T>('POST', p, b ?? {}, signal),
     patch: <T>(p: string, b: unknown) => req<T>('PATCH', p, b),

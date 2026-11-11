@@ -49,7 +49,12 @@ export interface SolutionView {
 }
 
 export interface Diagnosis {
-  summary: string; confidence: Level; grounded: boolean;
+  summary: string;
+  /** The single thing to check or do first (absent in records made by older versions). */
+  firstAction?: string;
+  /** What the technician could tell the assistant to narrow the diagnosis down. */
+  questions?: string[];
+  confidence: Level; grounded: boolean;
   causes: { title: string; why: string; likelihood: Level }[];
   steps: { title: string; detail: string; measure: string | null; source: number | null }[];
   parts: { name: string; action: 'check' | 'replace'; code: string | null; note: string; source: number | null }[];
@@ -58,9 +63,37 @@ export interface Diagnosis {
 
 export interface Source { title: string; h: string; t: string }
 
+/** A manual's explanation of an error code. */
+export interface CodeHit { code: string; text: string; device: string; title: string }
+
+/** What the knowledge base says about a fault before any AI is involved; arrives within milliseconds. */
+export interface Quick { codes: CodeHit[]; sols: SolutionView[]; docs: Source[] }
+
+/** Shortcuts for a device: faults others already solved on it, and the codes its manuals define. */
+export interface QuickList {
+  faults: { id: string; symptom: string; code: string; status: SolStatus }[];
+  codes: { code: string; text: string }[];
+}
+
+/** One line of a streamed answer. */
+export type StreamEvent =
+  | { type: 'quick'; quick: Quick }
+  | { type: 'partial'; res: Diagnosis }
+  | { type: 'delta'; text: string }
+  | { type: 'done'; item: HistoryItem | null }
+  | { type: 'error'; error: string }
+  | { type: 'ping' };
+
+/** A PDF or text file attached to a fault report. */
+export interface FilePayload { name: string; mediaType: 'application/pdf' | 'text/plain'; data: string }
+
+export interface DeviceLabel { brand: string; model: string; serial: string; device: string; label: string }
+
 export interface HistoryItem {
   id: string; q: string; dev: string; date: string; res: Diagnosis; done: Record<string, boolean>;
   follow: { q: string; a: string }[]; solIds: string[]; srcs: Source[]; sols: SolutionView[];
+  codes?: CodeHit[];
+  attached?: { photos: number; file: string };
 }
 
 export interface CourseView {
@@ -91,7 +124,15 @@ export interface AdminOverview {
   fee: number;
   sales: { courseId: string; title: string; usd: number; fee: number; date: string }[];
   totalSales: number; totalFee: number;
-  docs: { id: string; title: string; brand: string; model: string; kind: 'sample' | 'manual'; chunks: number }[];
+  docs: {
+    id: string; title: string; brand: string; model: string; kind: 'sample' | 'manual'; chunks: number;
+    /** Error codes found in this manual. */
+    codes: number;
+    /** Progress of the AI pass that adds search words and error codes; null when it never ran. */
+    ai: { status: 'running' | 'done' | 'failed'; done: number; total: number } | null;
+  }[];
+  /** Whether the server has an AI key. */
+  ai: boolean;
   chunkCount: number; solCount: number; reports: number;
   /** User listings waiting for the seller to be verified. */
   pendingListings: { id: string; title: string; seller: string; brand: string; model: string }[];
