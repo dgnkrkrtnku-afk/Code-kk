@@ -67,7 +67,7 @@ Cihaz listede aranmak yerine **etiketinin fotoğrafından** da seçilebilir.
 | Planlar | 5 plan, aylık/yıllık; Google Play aboneliği ya da puanla (süreli) satın alma; aboneliği Play'de yönetme |
 | Puan yükle | Google Play üzerinden puan paketi satın alma (500 / 1.500 / 3.000 / 6.000) |
 | Hesap | Plan ve bitiş tarihi, puan, kullanım, dil (TR/EN), para birimi, tema, yüksek kontrast, teklif isteklerim |
-| Geliştirici | Eğitim gelirleri, platform payı, manuel ekleme (metin, PDF/TXT, taranmış PDF'i AI ile okuma, tek ya da çok sayfa fotoğrafı), her manuel için AI dizini ve hata kodu sayısı, arama testi, satıcı doğrulama, AI'ın riskli bulduğu çözümleri onaylama |
+| Geliştirici | Eğitim gelirleri, platform payı, manuel ekleme (metin, PDF/TXT, taranmış PDF'i AI ile okuma, tek ya da çok sayfa fotoğrafı), her manuel için AI dizini ve hata kodu sayısı, e-postası doğrulanmış / doğrulama bekleyen hesap sayıları, arama testi, satıcı doğrulama, AI'ın riskli bulduğu çözümleri onaylama |
 
 ## Yerelde deneme
 

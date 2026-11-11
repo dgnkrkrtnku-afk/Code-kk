@@ -66,10 +66,13 @@ export default function Developer() {
     try {
       const f = await pickManual();
       if (!f) return;
-      let text = f.text || '';
-      if (f.pdfBase64) {
-        setBusy(t('k_reading'));
-        const r = await api.post<{ mode: 'text' | 'ai'; scanned: number; text?: string; job?: string }>('/admin/ingest-pdf', { data: f.pdfBase64, name: f.name, ai });
+      let text = '';
+      setBusy(t('k_reading'));
+      if (f.kind === 'text') {
+        // Decoded on the server: old text files are often not UTF-8, which is all a phone can read.
+        text = (await api.post<{ text: string }>('/admin/ingest-text', { data: f.data })).text;
+      } else {
+        const r = await api.post<{ mode: 'text' | 'ai'; scanned: number; text?: string; job?: string }>('/admin/ingest-pdf', { data: f.data, name: f.name, ai });
         text = r.mode === 'ai' && r.job ? await waitForJob(r.job) : r.text || '';
         // Without AI on the server the scanned pages of a mixed manual are missing from the text: say so.
         if (r.mode === 'text' && r.scanned > 0) toast(t('k_scanned_n', r.scanned));
@@ -163,6 +166,13 @@ export default function Developer() {
           </SetRow>
         )) : <View style={{ paddingVertical: 10 }}><P small muted>{t('d_nosale')}</P></View>}
       </Card>
+
+      <H2>{t('d_accounts')}</H2>
+      <Row style={{ marginBottom: 6 }}>
+        <Stat value={String(data.accounts.verified)} label={t('d_acc_ok')} />
+        <Stat value={String(data.accounts.pending)} label={t('d_acc_wait')} />
+      </Row>
+      <Note>{t('d_acc_d')}</Note>
 
       <H2>{t('d_man')}</H2>
       <Row style={{ marginBottom: 12 }}>

@@ -422,3 +422,36 @@ test('an answer finished by the fallback model is read whole, whether it continu
   );
   assert.equal(replyText(reply('end_turn', marker, textBlock('Plain answer.'))).all, 'Plain answer.');
 });
+
+test('an attached log in an old Turkish encoding reaches the AI readable; a binary file sent as text is refused', async () => {
+  const { service, seen } = fakeAi();
+  const app = await makeApp(service);
+  const t = await proUser(app, 'enc@example.com');
+  // "Şarj ünitesi ısınıyor" in Windows-1254
+  const ansi = Buffer.from([0xde, 0x61, 0x72, 0x6a, 0x20, 0xfc, 0x6e, 0x69, 0x74, 0x65, 0x73, 0x69, 0x20, 0xfd, 0x73, 0xfd, 0x6e, 0xfd, 0x79, 0x6f, 0x72]);
+  const ok = await app.call('POST', '/diagnose', { q: 'günlük ekte', dev: '', file: { name: 'servis.log', mediaType: 'text/plain', data: ansi.toString('base64') } }, t);
+  assert.equal(ok.status, 200);
+  const sent = seen.inputs[seen.inputs.length - 1].file;
+  assert.deepEqual(sent, { kind: 'text', name: 'servis.log', text: 'Şarj ünitesi ısınıyor' });
+
+  const binary = Buffer.concat([Buffer.from('PK\u0003\u0004'), Buffer.from(Array.from({ length: 600 }, (_, i) => (i * 37) % 256))]);
+  const calls = seen.calls;
+  const bad = await app.call('POST', '/diagnose', { q: 'ekte', dev: '', file: { name: 'rapor.docx', mediaType: 'text/plain', data: binary.toString('base64') } }, t);
+  assert.equal(bad.json.error, 'file_unreadable');
+  assert.equal(seen.calls, calls, 'nothing was sent to the AI');
+
+  // The developer panel uses the same decoder for manuals saved as text files.
+  const manual = await app.call('POST', '/admin/ingest-text', { data: ansi.toString('base64') }, t, ADMIN);
+  assert.equal(manual.json.text, 'Şarj ünitesi ısınıyor');
+  assert.equal((await app.call('POST', '/admin/ingest-text', { data: ansi.toString('base64') }, t)).status, 403);
+  assert.equal((await app.call('POST', '/admin/ingest-text', { data: binary.toString('base64') }, t, ADMIN)).json.error, 'file_unreadable');
+});
+
+test('the developer panel shows how many accounts have verified their address', async () => {
+  const app = await makeApp();
+  const t = await app.register('one@example.com');
+  await app.register('two@example.com');
+  await app.signUp('waiting@example.com');
+  const overview = (await app.call('GET', '/admin/overview', undefined, t, ADMIN)).json;
+  assert.deepEqual(overview.accounts, { verified: 2, pending: 1 });
+});

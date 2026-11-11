@@ -121,6 +121,8 @@ export interface ListingDetail {
 }
 
 export interface AdminOverview {
+  /** Accounts that proved their e-mail address, and registrations still waiting to. */
+  accounts: { verified: number; pending: number };
   fee: number;
   sales: { courseId: string; title: string; usd: number; fee: number; date: string }[];
   totalSales: number; totalFee: number;

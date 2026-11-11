@@ -47,36 +47,33 @@ async function readBase64(a: DocumentPicker.DocumentPickerAsset): Promise<string
   return a.base64 ? a.base64.replace(/^data:[^,]*,/, '') : new File(a.uri).base64();
 }
 
-function decodeBase64Utf8(b64: string): string {
-  const bin = globalThis.atob(b64);
-  return new TextDecoder('utf-8').decode(Uint8Array.from(bin, (ch) => ch.charCodeAt(0)));
-}
-
 const isPdf = (a: DocumentPicker.DocumentPickerAsset) => /\.pdf$/i.test(a.name) || a.mimeType === 'application/pdf';
 
 /** Largest attachment the server accepts with a fault report (as base64 characters, about 8 MB of file). */
 const MAX_ATTACHMENT = 11_000_000;
 
-/** Pick a PDF or text file (error log, service report, a few manual pages) to attach to a fault report. */
-export async function pickAttachment(): Promise<FilePayload | null | 'too_big'> {
-  const res = await DocumentPicker.getDocumentAsync({
-    type: ['application/pdf', 'text/plain', 'text/csv', 'text/markdown', 'application/json', 'text/xml'],
-    copyToCacheDirectory: true, base64: true,
-  });
+const isImage = (a: DocumentPicker.DocumentPickerAsset) => (a.mimeType || '').startsWith('image/') || /\.(jpe?g|png|webp|heic|gif|bmp)$/i.test(a.name);
+
+/**
+ * Pick a PDF or text file (error log, service report, a few manual pages) to attach to a fault report.
+ * Any file can be chosen, because phones label logs (.log, .csv, .dat…) with all sorts of types;
+ * the server reads the content and refuses what is not text.
+ */
+export async function pickAttachment(): Promise<FilePayload | null | 'too_big' | 'image'> {
+  const res = await DocumentPicker.getDocumentAsync({ type: '*/*', copyToCacheDirectory: true, base64: true });
   if (res.canceled || !res.assets[0]) return null;
   const a = res.assets[0];
+  if (isImage(a)) return 'image'; // photos go through the photo buttons, which shrink them first
   if ((a.size ?? 0) > MAX_ATTACHMENT * 0.74) return 'too_big';
   const data = await readBase64(a);
   if (data.length > MAX_ATTACHMENT) return 'too_big';
   return { name: a.name.slice(0, 120), mediaType: isPdf(a) ? 'application/pdf' : 'text/plain', data };
 }
 
-/** Developer panel: pick a manual. Returns base64 for PDFs (read on the server) and plain text otherwise. */
-export async function pickManual(): Promise<{ name: string; pdfBase64?: string; text?: string } | null> {
+/** Developer panel: pick a manual (PDF or a text file). The content goes to the server as base64 to be read there. */
+export async function pickManual(): Promise<{ name: string; kind: 'pdf' | 'text'; data: string } | null> {
   const res = await DocumentPicker.getDocumentAsync({ type: ['application/pdf', 'text/plain', 'text/markdown', 'text/csv'], copyToCacheDirectory: true, base64: true });
   if (res.canceled || !res.assets[0]) return null;
   const a = res.assets[0];
-  const name = a.name.replace(/\.[^.]+$/, '');
-  const data = await readBase64(a);
-  return isPdf(a) ? { name, pdfBase64: data } : { name, text: decodeBase64Utf8(data) };
+  return { name: a.name.replace(/\.[^.]+$/, ''), kind: isPdf(a) ? 'pdf' : 'text', data: await readBase64(a) };
 }

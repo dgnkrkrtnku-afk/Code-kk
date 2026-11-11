@@ -18,6 +18,7 @@ import { isPlan, PLANS, planForClient, planPrice, PT, PT_PER_USD, ptsFor } from 
 import type { PlayClient } from './play.js';
 import { COUNTRIES } from './seed.js';
 import { todayKey, uid, type Store } from './store.js';
+import { decodeText } from './text.js';
 import type { Chunk, Course, Diagnosis, Doc, HistoryItem, Lang, Listing, Solution, User } from './types.js';
 
 /* ------------------------------------------------------------------ helpers */
@@ -77,8 +78,9 @@ async function checkFile(f: z.infer<typeof FileZ> | null | undefined): Promise<a
     if (pages > MAX_ATTACH_PAGES) throw bad('file_too_long');
     return { kind: 'pdf', name, data: f.data };
   }
-  const text = bytes.toString('utf8').replace(/\u0000/g, '');
-  if (!text.trim()) throw bad('file_unreadable');
+  // Not necessarily UTF-8 (see decodeText); anything that is not text at all is refused rather than sent to the AI as noise.
+  const text = decodeText(bytes);
+  if (!text || !text.trim()) throw bad('file_unreadable');
   if (text.length > 200_000) throw bad('file_too_long');
   return { kind: 'text', name, text };
 }
@@ -1105,6 +1107,11 @@ export function createRouter(store: Store, deps: Deps) {
         codes: store.index.codesOf(devOf(x), 500).filter((e) => e.docId === x.id).length, ai: x.ai ?? null,
       })),
       ai: AI.aiConfigured(),
+      // How many accounts have proved their e-mail address, and how many registrations are still waiting to.
+      accounts: {
+        verified: Object.values(d.users).filter((u) => u.emailVerified).length,
+        pending: Object.values(d.users).filter((u) => !u.emailVerified).length,
+      },
       chunkCount: d.docs.reduce((a, x) => a + x.chunks.length, 0),
       solCount: d.sols.length,
       reports: d.reports.length,
@@ -1221,6 +1228,14 @@ export function createRouter(store: Store, deps: Deps) {
     audit('admin_pdf_ai_read', { by: req.ctx.user.id, pages: toRead.length });
     void readPdf(job, pdf, b.name, groups, slots);
     res.json({ mode: 'ai', pages, scanned: toRead.length, job: id });
+  }));
+
+  // A manual saved as a text file: decoded here because phones only read UTF-8, and old files often are not.
+  r.post('/admin/ingest-text', body('4mb'), wrap((req, res) => {
+    const b = parse(z.object({ data: z.string().min(4).max(3_500_000).regex(B64) }), req.body);
+    const text = decodeText(Buffer.from(b.data, 'base64'));
+    if (!text || !text.trim()) throw bad('file_unreadable');
+    res.json({ text });
   }));
 
   r.get('/admin/jobs/:id', wrap((req, res) => {

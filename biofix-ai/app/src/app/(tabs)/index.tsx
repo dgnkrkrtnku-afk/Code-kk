@@ -81,6 +81,7 @@ export default function Assistant() {
     try {
       const f = await pickAttachment();
       if (f === 'too_big') toast(t('a_file_big'));
+      else if (f === 'image') toast(t('a_file_image'));
       else if (f) setFile(f);
     } catch (e) {
       toast(errText(e));

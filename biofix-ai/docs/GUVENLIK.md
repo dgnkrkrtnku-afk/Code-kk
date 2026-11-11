@@ -52,7 +52,7 @@ KVKK aydınlatma metni için “Saklanan veriler” bölümünü bir hukukçuya 
 | Konu | Nasıl korunuyor |
 |---|---|
 | Talimat enjeksiyonu | Kurallar sistem isteminde, kullanıcı ve manuel metinleri ayrı etiketli veri bloklarında gider; metnin kendi bloğunu kapatıp talimat gibi görünmesi engellenir. |
-| Ekli dosyalar | Arızaya eklenen dosya yalnızca PDF ya da düz metin olabilir; PDF imzası ve sayfa sayısı (en çok 30) kontrol edilir, şifreli PDF reddedilir, metin 200 bin karakterle sınırlıdır. Ek, yalnızca fotoğrafla teşhis içeren planlarda kabul edilir. Dosyanın içeriği de “veri” olarak işaretlenir; içindeki talimatlar izlenmez. |
+| Ekli dosyalar | Arızaya eklenen dosya yalnızca PDF ya da düz metin olabilir. Sunucu dosya adına ya da türüne değil **içeriğine** bakar: PDF imzası ve sayfa sayısı (en çok 30) kontrol edilir, şifreli PDF reddedilir; metin olmayan dosyalar (resim, Word, arşiv) reddedilir ve AI'a gönderilmez; metin 200 bin karakterle sınırlıdır. Ek, yalnızca fotoğrafla teşhis içeren planlarda kabul edilir. Dosyanın içeriği de “veri” olarak işaretlenir; içindeki talimatlar izlenmez. |
 | Eklerin saklanması | Eklenen fotoğraf ve dosyalar sunucuda **saklanmaz**; teşhis için Claude API'ye iletilir ve bırakılır. Geçmişte yalnızca dosyanın adı ve fotoğraf sayısı kalır. |
 | Kötüye kullanım sınırları | Etiket okuma hesap başına günde 20; teşhis kotası AI çağrısından önce düşülür ve durdurulan ya da başarısız olan istekte iade edilir. Manuel okuma ve dizinleme yalnızca geliştirici anahtarıyla çalışır; aynı anda en çok 2 PDF okuma işi yürür. |
 | Tehlikeli çözümler | AI ön incelemesinin güvenlik riski işaretlediği çözüm, oy sayısı ne olursa olsun “Doğrulandı” olmaz ve başkalarının teşhisine verilmez; bir geliştirici inceleyip onaylamalıdır. |

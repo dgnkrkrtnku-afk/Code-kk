@@ -147,3 +147,19 @@ test('AI search words and AI-found codes on a section are indexed', () => {
   assert.equal(ix.search('hava kaçağı', '', 1, 'doc')[0].doc.id, 'k');
   assert.equal(ix.lookupCodes('P07 hatası', '')[0].text, 'Pressure too low.');
 });
+
+test('text files are decoded whatever their encoding; binary files are not text', async () => {
+  const { decodeText } = await import('../src/text.js');
+  const line = 'Şarj ünitesi ısınıyor, çıkış gerilimi düşük: 4,6 V\n';
+  assert.equal(decodeText(Buffer.from(line, 'utf8')), line);
+  assert.equal(decodeText(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(line, 'utf8')])), line, 'UTF-8 with a byte-order mark');
+  assert.equal(decodeText(Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(line, 'utf16le')])), line, 'UTF-16 as Windows tools write it');
+  assert.equal(decodeText(Buffer.from('ERROR E21 at 08:14\r\nCOMM timeout\r\n'.repeat(5), 'utf16le')), 'ERROR E21 at 08:14\r\nCOMM timeout\r\n'.repeat(5), 'UTF-16 without a mark');
+  // Windows-1254, the old Turkish "ANSI" encoding: ş=0xFE ü=0xFC ı=0xFD ç=0xE7 ğ=0xF0 ö=0xF6 İ=0xDD
+  const ansi = Buffer.from([0xde, 0x61, 0x72, 0x6a, 0x20, 0xfc, 0x6e, 0x69, 0x74, 0x65, 0x73, 0x69, 0x20, 0xfd, 0x73, 0xfd, 0x6e, 0xfd, 0x79, 0x6f, 0x72, 0x2c, 0x20, 0xe7, 0xfd, 0x6b, 0xfd, 0xfe]);
+  assert.equal(decodeText(ansi), 'Şarj ünitesi ısınıyor, çıkış');
+  assert.equal(decodeText(Buffer.from('\u001b[31mERROR\u001b[0m E21\n')), 'ERROR E21\n', 'terminal colour codes are dropped');
+  // Not text: a JPEG header with noise, a zip (as .docx files are), random bytes.
+  assert.equal(decodeText(Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(300, 1)])), null);
+  assert.equal(decodeText(Buffer.concat([Buffer.from('PK\u0003\u0004'), Buffer.from(Array.from({ length: 400 }, (_, i) => (i * 37) % 256))])), null);
+});

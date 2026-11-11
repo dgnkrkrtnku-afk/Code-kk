@@ -10,7 +10,7 @@ import { parseDataKey, Store } from './store.js';
 /** Routes that accept large bodies (photos, manuals). Their parser runs after sign-in, inside the router. */
 const LARGE_BODY = new Set([
   '/api/diagnose', '/api/identify-device', '/api/solutions', '/api/courses',
-  '/api/admin/docs', '/api/admin/ingest-pdf', '/api/admin/ocr',
+  '/api/admin/docs', '/api/admin/ingest-pdf', '/api/admin/ingest-text', '/api/admin/ocr',
 ]);
 
 export function createApp(store: Store, deps: Deps) {
