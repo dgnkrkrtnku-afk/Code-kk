@@ -9,8 +9,8 @@ import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { AiError, buildDiagnosisPrompt, buildPrecheckPrompt, untrusted } from '../src/ai.js';
 import { RateLimiter, weakPassword } from '../src/auth.js';
-import { adminToken, demoPayments, printResetCodes, welcomePoints } from '../src/config.js';
-import { createMailer } from '../src/mailer.js';
+import { adminToken, demoPayments, printEmailCodes, welcomePoints } from '../src/config.js';
+import { createMailer, type Mailer } from '../src/mailer.js';
 import { createApp } from '../src/index.js';
 import { isPlan } from '../src/plans.js';
 import type { PlayClient, PlaySubscription } from '../src/play.js';
@@ -28,8 +28,15 @@ const servers: Server[] = [];
 after(() => servers.forEach((s) => s.close()));
 
 /** Each test group gets its own server, store and rate limiter. */
-async function makeApp(ai?: AiService, store = new Store(null), play: PlayClient | null = null) {
-  const server = createApp(store, { mailer: { async sendResetCode() {} }, play, ai }).listen(0);
+async function makeApp(ai?: AiService, store = new Store(null), play: PlayClient | null = null, mail?: Mailer) {
+  const codes = new Map<string, string>();  // latest verification code per mailbox
+  const resets = new Map<string, string>(); // latest password reset code per mailbox
+  const mailer: Mailer = mail ?? {
+    enabled: true,
+    async sendVerifyCode(to, code) { codes.set(to, code); },
+    async sendResetCode(to, code) { resets.set(to, code); },
+  };
+  const server = createApp(store, { mailer, play, ai }).listen(0);
   servers.push(server);
   await new Promise((r) => server.once('listening', r));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
@@ -44,9 +51,16 @@ async function makeApp(ai?: AiService, store = new Store(null), play: PlayClient
     try { json = text ? JSON.parse(text) : null; } catch { /* not json */ }
     return { status: res.status, json, headers: res.headers };
   }
-  const register = async (email: string, name = 'Test User', password = 'correct horse') =>
-    (await call('POST', '/auth/register', { email, password, name })).json.token as string;
-  return { base, store, call, register };
+  /** Register without confirming the address. */
+  const signUp = (email: string, name = 'Test User', password = 'correct horse') =>
+    call('POST', '/auth/register', { email, password, name });
+  /** Register and confirm the e-mailed code; returns the session token. */
+  const register = async (email: string, name = 'Test User', password = 'correct horse') => {
+    const r = await signUp(email, name, password);
+    await call('POST', '/auth/verify', { code: codes.get(email.trim().toLowerCase()) }, r.json.token);
+    return r.json.token as string;
+  };
+  return { base, store, call, register, signUp, codes, resets };
 }
 
 const diagnosis: Diagnosis = { summary: 'ok', confidence: 'medium', grounded: true, causes: [], steps: [], parts: [], warnings: [], community: [] };
@@ -193,7 +207,7 @@ test('the developer key locks out after repeated wrong guesses, and short keys a
 });
 
 test('insecure conveniences are opt-in: demo payments, welcome points, printed reset codes', async () => {
-  const keys = ['NODE_ENV', 'DEMO_PAYMENTS', 'WELCOME_POINTS', 'PRINT_RESET_CODES', 'SMTP_URL'] as const;
+  const keys = ['NODE_ENV', 'DEMO_PAYMENTS', 'WELCOME_POINTS', 'PRINT_RESET_CODES', 'PRINT_EMAIL_CODES', 'SMTP_URL'] as const;
   const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
   const logged: string[] = [];
   const orig = { log: console.log, warn: console.warn };
@@ -204,9 +218,11 @@ test('insecure conveniences are opt-in: demo payments, welcome points, printed r
     // Nothing set (e.g. a server deployed without reading the docs): everything is closed.
     assert.equal(demoPayments(), false);
     assert.equal(welcomePoints(), 0);
-    assert.equal(printResetCodes(), false);
+    assert.equal(printEmailCodes(), false);
+    assert.equal(createMailer().enabled, false, 'no SMTP and no opt-in: the server cannot send codes');
     await createMailer().sendResetCode('someone@example.com', '424242', 'tr');
-    assert.ok(!logged.join('\n').includes('424242'), 'reset codes are not written to the log by default');
+    await createMailer().sendVerifyCode('someone@example.com', '434343', 'tr');
+    assert.ok(!/424242|434343/.test(logged.join('\n')), 'codes are not written to the log by default');
 
     process.env.DEMO_PAYMENTS = 'true';
     assert.equal(demoPayments(), true);
@@ -214,16 +230,118 @@ test('insecure conveniences are opt-in: demo payments, welcome points, printed r
     process.env.WELCOME_POINTS = '50';
     assert.equal(welcomePoints(), 50);
 
-    process.env.PRINT_RESET_CODES = 'true';
+    process.env.PRINT_EMAIL_CODES = 'true';
+    assert.equal(createMailer().enabled, true);
     await createMailer().sendResetCode('someone@example.com', '515151', 'tr');
-    assert.ok(logged.join('\n').includes('515151'), 'explicit opt-in for local testing');
+    await createMailer().sendVerifyCode('someone@example.com', '525252', 'tr');
+    assert.ok(logged.join('\n').includes('515151') && logged.join('\n').includes('525252'), 'explicit opt-in for local testing');
+    delete process.env.PRINT_EMAIL_CODES;
+    process.env.PRINT_RESET_CODES = 'true';
+    assert.equal(printEmailCodes(), true, 'the older variable name still works');
     process.env.NODE_ENV = 'production';
-    assert.equal(printResetCodes(), false, 'never in production');
+    assert.equal(printEmailCodes(), false, 'never in production');
+    assert.equal(createMailer().enabled, false);
     await createMailer().sendResetCode('someone@example.com', '626262', 'tr');
     assert.ok(!logged.join('\n').includes('626262'));
   } finally {
     console.log = orig.log; console.warn = orig.warn;
     for (const k of keys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  }
+});
+
+/* ------------------------------------------------------------------ e-mail verification */
+
+test('an account is unusable until its e-mail address is verified', async () => {
+  const { call, signUp, codes } = await makeApp();
+  const r = await signUp('new@example.com');
+  assert.equal(r.status, 201);
+  assert.equal(r.json.me.user.emailVerified, false);
+  const t = r.json.token;
+  // Locked out of everything except its own account.
+  assert.equal((await call('GET', '/solutions', undefined, t)).json.error, 'email_unverified');
+  assert.equal((await call('POST', '/diagnose', { q: 'Cihaz açılmıyor' }, t)).status, 403);
+  assert.equal((await call('POST', '/me/plan', { plan: 'pro', how: 'card' }, t)).status, 403);
+  assert.equal((await call('POST', '/solutions', solution(), t)).status, 403);
+  assert.equal((await call('GET', '/me', undefined, t)).status, 200);
+
+  const code = codes.get('new@example.com')!;
+  const wrong = code === '000000' ? '111111' : '000000';
+  assert.equal((await call('POST', '/auth/verify', { code: wrong }, t)).json.error, 'bad_code');
+  assert.equal((await call('POST', '/auth/verify', { code: 'abcdef' }, t)).json.error, 'invalid_input');
+  const ok = await call('POST', '/auth/verify', { code }, t);
+  assert.equal(ok.json.user.emailVerified, true);
+  assert.equal((await call('GET', '/solutions', undefined, t)).status, 200);
+});
+
+test('verification codes die after five wrong guesses; a resend replaces them; resends are limited', async () => {
+  const { call, signUp, codes } = await makeApp();
+  const t = (await signUp('guess@example.com')).json.token;
+  const first = codes.get('guess@example.com')!;
+  const wrong = first === '000000' ? '111111' : '000000';
+  for (let i = 0; i < 5; i++) assert.equal((await call('POST', '/auth/verify', { code: wrong }, t)).json.error, 'bad_code');
+  assert.equal((await call('POST', '/auth/verify', { code: first }, t)).json.error, 'bad_code', 'the right code is dead after five misses');
+  // registration sent 1 code; 4 more are allowed this hour
+  for (let i = 0; i < 4; i++) assert.equal((await call('POST', '/auth/resend', {}, t)).status, 200);
+  assert.equal((await call('POST', '/auth/resend', {}, t)).status, 429);
+  assert.equal((await call('POST', '/auth/verify', { code: codes.get('guess@example.com') }, t)).json.user.emailVerified, true);
+  assert.equal((await call('POST', '/auth/resend', {}, t)).status, 200, 'nothing to do once verified');
+});
+
+test('registering someone else\'s address does not lock the real owner out', async () => {
+  const { call, signUp, resets, store } = await makeApp();
+  const squatter = (await signUp('owner@example.com', 'Squatter')).json.token;
+  assert.equal((await signUp('owner@example.com', 'Real Owner')).status, 409, 'held while the first registration can still verify');
+  // The owner can take the address over right away with "forgot password": the code goes to their mailbox.
+  await call('POST', '/auth/forgot', { email: 'owner@example.com' });
+  await new Promise((r) => setTimeout(r, 10));
+  const reset = await call('POST', '/auth/reset', { email: 'owner@example.com', code: resets.get('owner@example.com'), password: 'owner new pass 1' });
+  assert.equal(reset.json.me.user.emailVerified, true, 'receiving the reset code proves the mailbox');
+  assert.equal((await call('GET', '/me', undefined, squatter)).status, 401);
+
+  // After the window, a new registration simply replaces an unverified one.
+  const a = await signUp('late@example.com', 'First Try');
+  store.findByEmail('late@example.com')!.createdAt = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+  const b = await signUp('late@example.com', 'Second Try');
+  assert.equal(b.status, 201);
+  assert.equal((await call('GET', '/me', undefined, a.json.token)).status, 401);
+  assert.equal((await call('GET', '/me', undefined, b.json.token)).json.user.name, 'Second Try');
+});
+
+test('unverified accounts are deleted after a week; verified ones are kept', async () => {
+  const { signUp, register, store } = await makeApp();
+  await signUp('ghost@example.com');
+  await register('kept@example.com');
+  store.purge(Date.now() + 8 * 86_400_000);
+  assert.equal(store.findByEmail('ghost@example.com'), undefined);
+  assert.ok(store.findByEmail('kept@example.com'));
+});
+
+test('signing in to an unverified account sends a fresh code when the old one has expired', async () => {
+  const { call, signUp, codes, store } = await makeApp();
+  await signUp('again@example.com');
+  const u = store.findByEmail('again@example.com')!;
+  store.db.verifyCodes[u.id].expiresAt = Date.now() - 1;
+  codes.delete('again@example.com');
+  const login = await call('POST', '/auth/login', { email: 'again@example.com', password: 'correct horse' });
+  assert.equal(login.json.me.user.emailVerified, false);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.ok(codes.has('again@example.com'));
+  assert.equal((await call('POST', '/auth/verify', { code: codes.get('again@example.com') }, login.json.token)).json.user.emailVerified, true);
+});
+
+test('registration is refused when the server has no way to send the code', async () => {
+  const saved = { s: process.env.SMTP_URL, p: process.env.PRINT_EMAIL_CODES, r: process.env.PRINT_RESET_CODES };
+  delete process.env.SMTP_URL; delete process.env.PRINT_EMAIL_CODES; delete process.env.PRINT_RESET_CODES;
+  try {
+    const { call, store } = await makeApp(undefined, new Store(null), null, createMailer());
+    const r = await call('POST', '/auth/register', { email: 'nomail@example.com', password: 'correct horse', name: 'No Mail' });
+    assert.equal(r.status, 503);
+    assert.equal(r.json.error, 'mail_not_configured');
+    assert.equal(store.findByEmail('nomail@example.com'), undefined, 'no half-created account is left behind');
+  } finally {
+    for (const [k, v] of [['SMTP_URL', saved.s], ['PRINT_EMAIL_CODES', saved.p], ['PRINT_RESET_CODES', saved.r]] as const) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
   }
 });
 

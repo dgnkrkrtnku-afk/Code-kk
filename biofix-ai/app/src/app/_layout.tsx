@@ -4,6 +4,8 @@ import { useEffect } from 'react';
 import { ActivityIndicator, Text, View } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { AuthScreen } from '../components/AuthScreen';
+import { VerifyScreen } from '../components/VerifyScreen';
+import { Btn } from '../components/ui';
 import { AppProvider, CONFIG_ERROR, useApp } from '../lib/app-context';
 import { startBilling, stopBilling } from '../lib/billing';
 
@@ -21,7 +23,7 @@ function Toast() {
 }
 
 function Shell() {
-  const { ready, c, dark, t, token, me, api, setMe } = useApp();
+  const { ready, c, dark, t, token, me, meError, refreshMe, signOut, api, setMe } = useApp();
   const userId = me?.user.id;
   const playOn = !!me?.billing.google;
 
@@ -50,6 +52,31 @@ function Shell() {
       <View style={{ flex: 1, backgroundColor: c.bg }}>
         <StatusBar style={dark ? 'light' : 'dark'} />
         <AuthScreen />
+        <Toast />
+      </View>
+    );
+  }
+  if (!me) {
+    // Signed in, but the profile has not arrived yet (app start, or the server is unreachable).
+    return (
+      <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', padding: 28, gap: 14, backgroundColor: c.bg }}>
+        <StatusBar style={dark ? 'light' : 'dark'} />
+        {meError ? (
+          <>
+            <Text style={{ fontSize: 14, color: c.ink, textAlign: 'center', lineHeight: 21 }}>{meError}</Text>
+            <Btn title={t('retry')} onPress={() => { void refreshMe(); }} />
+            <Btn kind="ghost" title={t('h_logout')} onPress={() => { void signOut(); }} />
+          </>
+        ) : <ActivityIndicator color={c.cyan} />}
+        <Toast />
+      </View>
+    );
+  }
+  if (!me.user.emailVerified) {
+    return (
+      <View style={{ flex: 1, backgroundColor: c.bg }}>
+        <StatusBar style={dark ? 'light' : 'dark'} />
+        <VerifyScreen />
         <Toast />
       </View>
     );

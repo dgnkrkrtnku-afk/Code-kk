@@ -95,6 +95,8 @@ export interface Subscription {
 export interface User {
   id: string;
   email: string;
+  /** True once the user has entered a code sent to this address (proof they can read the mailbox). */
+  emailVerified?: boolean;
   passHash: string;
   createdAt: string;
   name: string;
@@ -141,6 +143,8 @@ export interface Db {
   sessions: Record<string, Session>;
   /** Keyed by e-mail. */
   resetCodes: Record<string, ResetCode>;
+  /** Address verification codes, keyed by user id. */
+  verifyCodes: Record<string, ResetCode>;
   /** Keyed by SHA-256 of the Play purchase token. */
   purchases: Record<string, PurchaseRecord>;
   reports: { listingId: string; userId: string; date: string }[];

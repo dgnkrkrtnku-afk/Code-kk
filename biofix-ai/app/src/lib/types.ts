@@ -7,7 +7,10 @@ export interface PlanInfo { usd: number; quota: number; sell: number; teach: boo
 
 export interface Me {
   user: {
-    id: string; email: string; name: string; plan: PlanId; planUntil: string | null; billing: 'month' | 'year';
+    id: string; email: string;
+    /** False until the user has typed the code e-mailed to this address. */
+    emailVerified: boolean;
+    name: string; plan: PlanId; planUntil: string | null; billing: 'month' | 'year';
     /** Present while a Google Play subscription is bound to the account. */
     sub: { productId: string; expiresAt: string; autoRenew: boolean } | null;
     points: number;

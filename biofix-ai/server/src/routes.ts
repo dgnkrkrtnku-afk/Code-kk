@@ -5,7 +5,8 @@ import { z } from 'zod';
 import * as ai from './ai.js';
 import {
   dummyHash, hashPassword, MAX_PASSWORD, newResetCode, newSessionToken, normalizeEmail, RateLimiter,
-  RESET_MAX_ATTEMPTS, RESET_TTL_MS, resetHash, SESSION_TTL_MS, sha256, validEmail, verifyPassword, weakPassword,
+  RESET_MAX_ATTEMPTS, RESET_TTL_MS, resetHash, SESSION_TTL_MS, sha256, UNVERIFIED_HOLD_MS, validEmail, VERIFY_MAX_ATTEMPTS,
+  VERIFY_TTL_MS, verifyPassword, weakPassword,
 } from './auth.js';
 import { Billing, PLAY_BASE_PLANS, PLAY_SUBSCRIPTIONS, POINT_PACKS, type PlayNotification } from './billing.js';
 import { adminToken, demoPayments, rtdnSecret } from './config.js';
@@ -155,7 +156,7 @@ export function createRouter(store: Store, deps: Deps) {
     const u = c.user;
     return {
       user: {
-        id: u.id, email: u.email, name: u.name, plan: u.plan, planUntil: u.planUntil, billing: u.billing,
+        id: u.id, email: u.email, emailVerified: !!u.emailVerified, name: u.name, plan: u.plan, planUntil: u.planUntil, billing: u.billing,
         // The purchase token stays on the server; the app only needs to know a Play subscription exists.
         sub: u.sub ? { productId: u.sub.productId, expiresAt: u.sub.expiresAt, autoRenew: u.sub.autoRenew } : null,
         points: u.points, ledger: u.ledger.slice(0, 20), usedToday: store.usedToday(u), quotes: u.quotes, owned: u.owned,
@@ -211,17 +212,40 @@ export function createRouter(store: Store, deps: Deps) {
     return { token, me: meView({ user: u, lang: langOf(req), isAdmin: adminOf(req), sessionKey: key }) };
   }
 
+  /** An address is taken by a verified account, or by a registration still inside its verification window. */
+  function addressTaken(email: string): boolean {
+    const u = store.findByEmail(email);
+    return !!u && (!!u.emailVerified || Date.now() - Date.parse(u.createdAt) < UNVERIFIED_HOLD_MS);
+  }
+
+  /** E-mail a fresh verification code (replacing any earlier one). Returns false when the hourly limit is used up. */
+  function sendVerification(u: User, lang: Lang): boolean {
+    if (!deps.mailer.enabled || !limiter.take(`verify-send:${u.id}`, 5, HOUR)) return false;
+    const code = newResetCode();
+    db().verifyCodes[u.id] = { codeHash: resetHash(u.email, code), expiresAt: Date.now() + VERIFY_TTL_MS, attempts: 0 };
+    store.save();
+    deps.mailer.sendVerifyCode(u.email, code, lang)
+      .catch((e) => console.error('verification e-mail failed:', e instanceof Error ? e.message : e));
+    return true;
+  }
+
   r.post('/auth/register', wrap(async (req, res) => {
     limit(`register:${ipOf(req)}`, 30, HOUR); // per IP; hospitals often share one address
     const b = parse(z.object({ email: z.string().max(254), password: z.string().max(MAX_PASSWORD), name: NameZ }), req.body);
     const email = normalizeEmail(b.email);
     if (!validEmail(email)) throw bad('invalid_email');
     if (weakPassword(b.password, email, b.name)) throw bad('weak_password');
-    if (store.findByEmail(email)) throw new HttpError(409, 'email_taken');
+    // Every new account must prove its address, so there is no point creating one we cannot e-mail.
+    if (!deps.mailer.enabled) throw new HttpError(503, 'mail_not_configured');
+    if (addressTaken(email)) throw new HttpError(409, 'email_taken');
     const passHash = await hashPassword(b.password);
-    if (store.findByEmail(email)) throw new HttpError(409, 'email_taken'); // registered while we were hashing
+    if (addressTaken(email)) throw new HttpError(409, 'email_taken'); // registered while we were hashing
+    // An older registration that never proved the address gives way to this one.
+    const stale = store.findByEmail(email);
+    if (stale) store.deleteUser(stale.id);
     const u = store.createUser(email, passHash, b.name);
     audit('register', { user: u.id });
+    sendVerification(u, langOf(req));
     res.status(201).json(signIn(req, u));
   }));
 
@@ -240,6 +264,9 @@ export function createRouter(store: Store, deps: Deps) {
     }
     limiter.reset(`login:${ipOf(req)}:${email}`);
     audit('login', { user: u.id });
+    // Signing in to an account that is still unverified: make sure a usable code is on its way.
+    const vc = db().verifyCodes[u.id];
+    if (!u.emailVerified && (!vc || vc.expiresAt < Date.now() || vc.attempts >= VERIFY_MAX_ATTEMPTS)) sendVerification(u, langOf(req));
     res.json(signIn(req, u));
   }));
 
@@ -274,6 +301,9 @@ export function createRouter(store: Store, deps: Deps) {
     if (!safeEq(rc.codeHash, resetHash(email, b.code))) throw bad('bad_code');
     delete db().resetCodes[email];
     u.passHash = await hashPassword(b.password);
+    // The code arrived in this mailbox, which is exactly what address verification proves.
+    u.emailVerified = true;
+    delete db().verifyCodes[u.id];
     store.dropSessions(u.id); // sign out everywhere
     audit('password_reset', { user: u.id });
     res.json(signIn(req, u));
@@ -315,6 +345,13 @@ export function createRouter(store: Store, deps: Deps) {
     next();
   });
 
+  // Until the address is verified an account can only verify itself, sign out or delete itself.
+  const OPEN_TO_UNVERIFIED = new Set(['/me', '/me/delete', '/auth/verify', '/auth/resend', '/auth/logout', '/auth/logout-all']);
+  r.use((req, _res, next) => {
+    if (!(req as Req).ctx.user.emailVerified && !OPEN_TO_UNVERIFIED.has(req.path)) throw new HttpError(403, 'email_unverified');
+    next();
+  });
+
   // Developer panel: checked here, before any large request body is read.
   r.use('/admin', (req, _res, next) => {
     if (!(req as Req).ctx.isAdmin) throw forbidden('admin_only');
@@ -326,6 +363,34 @@ export function createRouter(store: Store, deps: Deps) {
   r.post('/auth/logout', wrap((req, res) => {
     delete db().sessions[req.ctx.sessionKey];
     store.save();
+    res.json({ ok: true });
+  }));
+
+  r.post('/auth/verify', wrap((req, res) => {
+    const u = req.ctx.user;
+    if (!u.emailVerified) {
+      limit(`verify:${u.id}`, 30, HOUR);
+      const { code } = parse(z.object({ code: z.string().trim().regex(/^\d{6}$/) }), req.body);
+      const vc = db().verifyCodes[u.id];
+      if (!vc || vc.expiresAt < Date.now() || vc.attempts >= VERIFY_MAX_ATTEMPTS) throw bad('bad_code');
+      vc.attempts++;
+      store.save();
+      if (!safeEq(vc.codeHash, resetHash(u.email, code))) throw bad('bad_code');
+      delete db().verifyCodes[u.id];
+      u.emailVerified = true;
+      store.save();
+      audit('email_verified', { user: u.id });
+    }
+    res.json(meView(req.ctx));
+  }));
+
+  r.post('/auth/resend', wrap((req, res) => {
+    const u = req.ctx.user;
+    if (!u.emailVerified) {
+      if (!deps.mailer.enabled) throw new HttpError(503, 'mail_not_configured');
+      limit(`verify-send-ip:${ipOf(req)}`, 30, HOUR);
+      if (!sendVerification(u, req.ctx.lang)) throw new HttpError(429, 'too_many_attempts');
+    }
     res.json({ ok: true });
   }));
 

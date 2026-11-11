@@ -24,8 +24,13 @@ const play: PlayClient & { subs: typeof subs; products: typeof products; acked: 
   async getProduct(productId, token) { return products.get(`${productId}:${token}`) ?? null; },
 };
 
-const mails: { to: string; code: string }[] = [];
-const mailer = { async sendResetCode(to: string, code: string) { mails.push({ to, code }); } };
+const mails: { to: string; code: string }[] = []; // password reset codes
+const verifyCodes = new Map<string, string>();     // latest address verification code per mailbox
+const mailer = {
+  enabled: true,
+  async sendResetCode(to: string, code: string) { mails.push({ to, code }); },
+  async sendVerifyCode(to: string, code: string) { verifyCodes.set(to, code); },
+};
 
 let server: Server;
 let store: Store;
@@ -42,8 +47,12 @@ async function call(method: string, path: string, body?: unknown, token = A, ext
   const text = await res.text();
   return { status: res.status, json: (text ? JSON.parse(text) : null) as any };
 }
-const register = (email: string, name: string, password = 'correct horse') =>
-  call('POST', '/auth/register', { email, password, name }, '');
+/** Register and confirm the e-mailed code, like a real user would. */
+async function register(email: string, name: string, password = 'correct horse') {
+  const r = await call('POST', '/auth/register', { email, password, name }, '');
+  if (r.status === 201) await call('POST', '/auth/verify', { code: verifyCodes.get(r.json.me.user.email) }, r.json.token);
+  return r;
+}
 const inDays = (n: number) => new Date(Date.now() + n * 86_400_000).toISOString();
 const activeSub = (productId: string, over: Partial<PlaySubscription> = {}): PlaySubscription => ({
   state: 'SUBSCRIPTION_STATE_ACTIVE', productId, basePlanId: 'monthly', expiresAt: inDays(30), autoRenew: true,

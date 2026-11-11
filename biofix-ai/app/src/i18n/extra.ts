@@ -35,6 +35,13 @@ export const EXTRA = {
     au_e_code: 'Kod hatalı ya da süresi dolmuş.', au_e_many: 'Çok fazla deneme yapıldı. Biraz sonra yeniden dene.', au_e_name: 'Adını yaz (en az 2 karakter).',
     e_session: 'Oturumun kapandı. Yeniden giriş yap.',
 
+    // e-mail verification
+    ev_title: 'E-postanı doğrula', ev_sub: 'Bu adresin sana ait olduğunu doğrulamak için 6 haneli bir kod gönderdik:',
+    ev_verify: 'Doğrula', ev_resend: 'Kodu yeniden gönder', ev_resent: 'Yeni kod gönderildi. Önceki kod artık geçersiz.',
+    ev_hint: 'Kod 30 dakika geçerlidir. Gelmediyse gereksiz (spam) klasörüne bak. Adresi yanlış yazdıysan çıkış yapıp doğru adresle yeniden kayıt ol.',
+    ev_other: 'Çıkış yap / farklı adres kullan', ev_done: 'E-posta adresin doğrulandı.', ev_ok: 'Doğrulandı',
+    ev_e_needed: 'Önce e-posta adresini doğrulamalısın.', e_mail_cfg: 'Sunucuda e-posta gönderimi ayarlanmamış; şu an kayıt alınamıyor.',
+
     // account
     h_security: 'Hesap ve güvenlik', h_email: 'E-posta', h_logout: 'Çıkış yap', h_logout_all: 'Tüm cihazlardan çıkış yap', h_logged_out_all: 'Tüm cihazlardaki oturumlar kapatıldı.',
     h_change_pass: 'Şifre değiştir', h_cur_pass: 'Mevcut şifre', h_pass_changed: 'Şifren değişti. Diğer cihazlardaki oturumlar kapatıldı.',
@@ -94,6 +101,12 @@ export const EXTRA = {
     au_e_taken: 'An account already exists for this e-mail. Try signing in.', au_e_creds: 'Wrong e-mail or password.',
     au_e_code: 'The code is wrong or has expired.', au_e_many: 'Too many attempts. Try again later.', au_e_name: 'Enter your name (at least 2 characters).',
     e_session: 'You were signed out. Sign in again.',
+
+    ev_title: 'Verify your e-mail', ev_sub: 'To confirm this address is yours, we sent a 6-digit code to:',
+    ev_verify: 'Verify', ev_resend: 'Send the code again', ev_resent: 'A new code was sent. The previous one no longer works.',
+    ev_hint: 'The code is valid for 30 minutes. If it has not arrived, check your spam folder. If you mistyped the address, sign out and register again with the right one.',
+    ev_other: 'Sign out / use another address', ev_done: 'Your e-mail address is verified.', ev_ok: 'Verified',
+    ev_e_needed: 'Verify your e-mail address first.', e_mail_cfg: 'The server cannot send e-mail yet, so registration is closed for now.',
 
     h_security: 'Account and security', h_email: 'E-mail', h_logout: 'Sign out', h_logout_all: 'Sign out of all devices', h_logged_out_all: 'Signed out on every device.',
     h_change_pass: 'Change password', h_cur_pass: 'Current password', h_pass_changed: 'Password changed. Other devices were signed out.',

@@ -117,7 +117,8 @@ export default function Account() {
       <H2>{t('h_security')}</H2>
       <Card>
         <P small muted>{t('h_email')}</P>
-        <P bold selectable style={{ marginBottom: 12 }}>{me?.user.email ?? '—'}</P>
+        <P bold selectable>{me?.user.email ?? '—'}</P>
+        <P small style={{ color: c.ok, marginBottom: 12 }}>{me?.user.emailVerified ? '✓ ' + t('ev_ok') : ''}</P>
         <Input label={t('h_name')} value={name} onChangeText={setName} placeholder={t('h_name_ph')} maxLength={40} />
         {name.trim() !== (me?.user.name ?? '') ? <Btn kind="sec" sm busy={busy === 'name'} title={t('h_save')} onPress={saveName} style={{ alignSelf: 'flex-start', marginBottom: 12 }} /> : null}
         <Btn kind="sec" full title={t('h_change_pass')} onPress={() => open('password')} />

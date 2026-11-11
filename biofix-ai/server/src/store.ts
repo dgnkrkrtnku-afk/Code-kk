@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
-import { MAX_SESSIONS_PER_USER, SESSION_TTL_MS } from './auth.js';
+import { MAX_SESSIONS_PER_USER, SESSION_TTL_MS, UNVERIFIED_KEEP_MS } from './auth.js';
 import { welcomePoints } from './config.js';
 import { chunkText, KnowledgeIndex } from './kb.js';
 import { DAILY_REWARDS, PT } from './plans.js';
@@ -29,6 +29,7 @@ function seedDb(): Db {
     users: {},
     sessions: {},
     resetCodes: {},
+    verifyCodes: {},
     purchases: {},
     reports: [],
   };
@@ -97,6 +98,7 @@ export class Store {
     // v1 files predate accounts: add the new tables. Device-only users have no e-mail and can't sign in.
     db.sessions ??= {};
     db.resetCodes ??= {};
+    db.verifyCodes ??= {};
     db.purchases ??= {};
     db.version = 2;
     return db;
@@ -134,6 +136,13 @@ export class Store {
     for (const [k, v] of Object.entries(this.db.resetCodes)) {
       if (v.expiresAt < now) { delete this.db.resetCodes[k]; changed = true; }
     }
+    for (const [k, v] of Object.entries(this.db.verifyCodes)) {
+      if (v.expiresAt < now) { delete this.db.verifyCodes[k]; changed = true; }
+    }
+    // An account whose address was never proven holds no rights; after a week it is removed.
+    for (const u of Object.values(this.db.users)) {
+      if (!u.emailVerified && u.email && now - Date.parse(u.createdAt) > UNVERIFIED_KEEP_MS) { this.deleteUser(u.id); changed = true; }
+    }
     if (changed) this.save();
   }
 
@@ -146,7 +155,7 @@ export class Store {
   createUser(email: string, passHash: string, name: string): User {
     const points = welcomePoints();
     const u: User = {
-      id: uid(), email, passHash, createdAt: new Date().toISOString(), name,
+      id: uid(), email, emailVerified: false, passHash, createdAt: new Date().toISOString(), name,
       plan: 'free', planUntil: null, sub: null, billing: 'month', points,
       ledger: points ? [{ n: points, why: 'pt_welcome', date: todayKey() }] : [],
       usage: { d: todayKey(), n: 0 }, history: [], owned: [], quotes: [],
@@ -161,6 +170,7 @@ export class Store {
     const db = this.db;
     const email = db.users[id]?.email;
     delete db.users[id];
+    delete db.verifyCodes[id];
     if (email) delete db.resetCodes[email];
     db.sols = db.sols.filter((s) => s.userId !== id);
     db.sols.forEach((s) => { delete s.votes[id]; });

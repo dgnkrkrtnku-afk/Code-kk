@@ -24,7 +24,7 @@ export const ERROR_KEY: Record<string, string> = {
   image_rejected: 'e_img', generic: 'e_generic', no_session: 'e_session', insecure_url: 'e_insecure',
   // sign-in
   invalid_email: 'au_e_email', weak_password: 'au_e_weak', email_taken: 'au_e_taken', bad_credentials: 'au_e_creds',
-  bad_code: 'au_e_code', too_many_attempts: 'au_e_many',
+  bad_code: 'au_e_code', too_many_attempts: 'au_e_many', email_unverified: 'ev_e_needed', mail_not_configured: 'e_mail_cfg',
   // payments
   manage_in_play: 'b_e_manage', use_play: 'b_e_use_play', use_points: 'b_e_use_points', unknown_product: 'b_e_invalid',
   purchase_invalid: 'b_e_invalid', purchase_in_use: 'b_e_in_use', purchase_pending: 'b_e_pending',

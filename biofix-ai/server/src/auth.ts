@@ -63,10 +63,18 @@ export const newSessionToken = () => randomBytes(32).toString('base64url');
 export const SESSION_TTL_MS = 90 * 24 * 60 * 60 * 1000; // sliding: 90 days since last use
 export const MAX_SESSIONS_PER_USER = 10;
 
+/** Six-digit code sent by e-mail (address verification, password reset). */
 export const newResetCode = () => String(randomInt(0, 1_000_000)).padStart(6, '0');
 export const RESET_TTL_MS = 15 * 60 * 1000;
 export const RESET_MAX_ATTEMPTS = 5;
 export const resetHash = (email: string, code: string) => sha256(`${email}:${code}`);
+
+export const VERIFY_TTL_MS = 30 * 60 * 1000;
+export const VERIFY_MAX_ATTEMPTS = 5;
+/** While a fresh registration is waiting for its code, the address can't be registered again. */
+export const UNVERIFIED_HOLD_MS = 30 * 60 * 1000;
+/** Accounts whose address was never verified are deleted after this long. */
+export const UNVERIFIED_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const normalizeEmail = (s: string) => String(s).trim().toLowerCase();
 export const validEmail = (s: string) => s.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s);
