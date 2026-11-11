@@ -100,6 +100,8 @@ export class Store {
     db.resetCodes ??= {};
     db.verifyCodes ??= {};
     db.purchases ??= {};
+    // An AI indexing pass that was running when the server stopped did not finish.
+    for (const d of db.docs) if (d.ai?.status === 'running') d.ai.status = 'failed';
     db.version = 2;
     return db;
   }

@@ -3,7 +3,14 @@ export type PlanId = 'free' | 'pro' | 'trainer' | 'biz' | 'org';
 export type SolStatus = 'ver' | 'pen' | 'rej';
 export type Level = 'high' | 'medium' | 'low';
 
-export interface Chunk { h: string; t: string }
+export interface Chunk {
+  h: string;
+  t: string;
+  /** Search words the AI added while indexing the manual (symptoms and component names in Turkish and English). */
+  k?: string;
+  /** Error codes the AI found in this section. */
+  codes?: { code: string; text: string }[];
+}
 
 export interface SeedDoc { title: string; brand: string; model: string; text: string }
 
@@ -15,6 +22,8 @@ export interface Doc {
   kind: 'sample' | 'manual';
   chunks: Chunk[];
   createdAt: string;
+  /** Progress of the AI pass that adds search words and error codes to each section. */
+  ai?: { status: 'running' | 'done' | 'failed'; done: number; total: number };
 }
 
 export interface AiCheck { v: 'consistent' | 'conflict' | 'not_covered'; note: string; safe: boolean }
@@ -57,12 +66,16 @@ export interface Listing {
 
 export interface Diagnosis {
   summary: string;
+  /** The single thing to check or do first. */
+  firstAction: string;
   confidence: Level;
   grounded: boolean;
   causes: { title: string; why: string; likelihood: Level }[];
   steps: { title: string; detail: string; measure: string | null; source: number | null }[];
   parts: { name: string; action: 'check' | 'replace'; code: string | null; note: string; source: number | null }[];
   warnings: string[];
+  /** What the technician could tell the assistant to narrow the diagnosis down. */
+  questions: string[];
   community: number[];
 }
 
@@ -70,6 +83,10 @@ export interface HistoryItem {
   id: string; q: string; dev: string; date: string; res: Diagnosis;
   done: Record<string, boolean>; follow: { q: string; a: string }[];
   solIds: string[]; srcs: { title: string; h: string; t: string }[];
+  /** Manual entries for the error codes named in the report. */
+  codes?: { code: string; text: string; device: string; title: string }[];
+  /** What was attached (the files themselves are not kept). */
+  attached?: { photos: number; file: string };
 }
 
 export interface LedgerEntry { n: number; why: string; date: string }

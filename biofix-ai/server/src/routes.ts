@@ -1,5 +1,6 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { timingSafeEqual } from 'node:crypto';
+import { PDFDocument } from 'pdf-lib';
 import { PDFParse } from 'pdf-parse';
 import { z } from 'zod';
 import * as ai from './ai.js';
@@ -11,20 +12,21 @@ import {
 import { Billing, PLAY_BASE_PLANS, PLAY_SUBSCRIPTIONS, POINT_PACKS, type PlayNotification } from './billing.js';
 import { adminToken, demoPayments, rtdnSecret } from './config.js';
 import { bad, forbidden, HttpError, notFound } from './errors.js';
-import { chunkText, devOf, NEED_OK, prefixMatchCount, solStatus } from './kb.js';
+import { chunkText, devOf, NEED_OK, prefixMatchCount, sameDevice, solStatus } from './kb.js';
 import type { Mailer } from './mailer.js';
 import { isPlan, PLANS, planForClient, planPrice, PT, PT_PER_USD, ptsFor } from './plans.js';
 import type { PlayClient } from './play.js';
 import { COUNTRIES } from './seed.js';
 import { todayKey, uid, type Store } from './store.js';
-import type { Course, HistoryItem, Lang, Listing, Solution, User } from './types.js';
+import type { Course, Diagnosis, Doc, HistoryItem, Lang, Listing, Solution, User } from './types.js';
 
 /* ------------------------------------------------------------------ helpers */
 
 interface Ctx { user: User; lang: Lang; isAdmin: boolean; sessionKey: string }
 type Req = Request & { ctx: Ctx };
 
-export type AiService = Pick<typeof ai, 'aiConfigured' | 'diagnose' | 'followUp' | 'precheck' | 'transcribePage'>;
+export type AiService = Pick<typeof ai,
+  'aiConfigured' | 'diagnose' | 'followUp' | 'precheck' | 'identifyDevice' | 'transcribePage' | 'transcribePdf' | 'indexSections'>;
 
 /** Things the router talks to outside this process; tests pass fakes. */
 export interface Deps { mailer: Mailer; play: PlayClient | null; ai?: AiService }
@@ -45,6 +47,65 @@ function checkImage(img: Image | null | undefined): Image | null {
   if (!ok) throw bad('not_image');
   return img;
 }
+
+const B64 = /^[A-Za-z0-9+/]+={0,2}$/;
+/** A file attached to a fault report: a PDF or a plain-text file such as an error log. */
+const FileZ = z.object({
+  name: z.string().trim().min(1).max(200),
+  mediaType: z.enum(['application/pdf', 'text/plain']),
+  data: z.string().min(4).max(11_000_000).regex(B64),
+});
+/** Longest PDF a technician may attach to one question (every page is read by the AI and costs tokens). */
+const MAX_ATTACH_PAGES = Number(process.env.MAX_ATTACH_PAGES) || 30;
+
+/** Check that an attachment really is what it claims to be and is small enough to read. */
+async function checkFile(f: z.infer<typeof FileZ> | null | undefined): Promise<ai.Attachment | null> {
+  if (!f) return null;
+  const bytes = Buffer.from(f.data, 'base64');
+  const name = f.name.replace(/[\u0000-\u001f<>"]/g, ' ').slice(0, 120);
+  if (f.mediaType === 'application/pdf') {
+    if (!bytes.subarray(0, 1024).includes('%PDF-')) throw bad('file_unreadable');
+    let pages = 0;
+    try {
+      const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
+      if (pdf.isEncrypted) throw new Error('encrypted');
+      pages = pdf.getPageCount();
+    } catch {
+      throw bad('file_unreadable');
+    }
+    if (pages > MAX_ATTACH_PAGES) throw bad('file_too_long');
+    return { kind: 'pdf', name, data: f.data };
+  }
+  const text = bytes.toString('utf8').replace(/\u0000/g, '');
+  if (!text.trim()) throw bad('file_unreadable');
+  if (text.length > 200_000) throw bad('file_too_long');
+  return { kind: 'text', name, text };
+}
+
+/** The error code to show for anything thrown while a response is already streaming. */
+function codeOf(e: unknown): string {
+  if (e instanceof HttpError) return e.code;
+  if (e instanceof ai.AiError) return e.code;
+  return 'generic';
+}
+
+/**
+ * Start a streamed answer: one JSON object per line, written as soon as it is known.
+ * The client shows each line when it arrives instead of waiting for the whole answer.
+ */
+function ndjson(res: Response) {
+  res.status(200);
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('X-Accel-Buffering', 'no'); // nginx: pass each line through instead of buffering
+  res.flushHeaders();
+  // Keeps mobile networks and proxies from closing the connection while the model is thinking.
+  const ping = setInterval(() => { if (!res.writableEnded && !res.destroyed) res.write('{"type":"ping"}\n'); }, 15_000);
+  return {
+    send(o: unknown) { if (!res.writableEnded && !res.destroyed) res.write(JSON.stringify(o) + '\n'); },
+    end() { clearInterval(ping); if (!res.writableEnded) res.end(); },
+  };
+}
+const wantsStream = (req: Request) => (req.header('accept') || '').includes('application/x-ndjson');
 
 /** Display names appear next to other people's content: no control characters or markup. */
 const NameZ = z.string().trim().min(2).max(40).regex(/^[^\u0000-\u001f\u007f<>]*$/);
@@ -495,59 +556,119 @@ export function createRouter(store: Store, deps: Deps) {
 
   /* ================================================================ assistant */
 
+  const deviceList = () => [...new Set(db().docs.map(devOf).concat(db().sols.map(devOf)).filter(Boolean))].sort();
+
   r.get('/devices', wrap((_req, res) => {
-    const list = [...new Set(db().docs.map(devOf).concat(db().sols.map(devOf)).filter(Boolean))].sort();
-    res.json({ devices: list });
+    res.json({ devices: deviceList() });
   }));
 
-  r.post('/diagnose', body('16mb'), wrap(async (req, res) => {
+  // One tap away under the device selector: faults others already solved on this device, and its error codes.
+  r.get('/quick', wrap((req, res) => {
+    const dev = String(req.query.dev || '').slice(0, 200);
+    if (!dev) { res.json({ faults: [], codes: [] }); return; }
+    const faults = db().sols
+      .filter((x) => sameDevice(devOf(x), dev) && solStatus(x) !== 'rej' && !x.ai?.safe)
+      .sort((x, y) => Number(solStatus(y) === 'ver') - Number(solStatus(x) === 'ver') || y.ok - x.ok)
+      .slice(0, 6)
+      .map((x) => ({ id: x.id, symptom: x.symptom, code: x.code, status: solStatus(x) }));
+    res.json({ faults, codes: store.index.codesOf(dev, 30).map((e) => ({ code: e.code, text: e.text })) });
+  }));
+
+  // Read the make and model from a photo of the device label, so the technician doesn't have to type or pick it.
+  r.post('/identify-device', body('16mb'), wrap(async (req, res) => {
+    const { image } = parse(z.object({ image: ImageZ }), req.body);
+    const img = checkImage(image)!;
+    limit(`ai-label:${req.ctx.user.id}`, 20, DAY, 'slow_down');
+    const found = await AI.identifyDevice(img, deviceList());
+    res.json({ ...found, label: `${found.brand} ${found.model}`.trim() });
+  }));
+
+  r.post('/diagnose', body('24mb'), wrap(async (req, res) => {
     const c = req.ctx;
-    const b = parse(z.object({ q: z.string().max(4000).default(''), dev: z.string().max(200).default(''), image: ImageZ.nullable().optional() }), req.body);
+    const b = parse(z.object({
+      q: z.string().max(4000).default(''), dev: z.string().max(200).default(''),
+      images: z.array(ImageZ).max(4).default([]),
+      image: ImageZ.nullable().optional(), // a single photo, as older app versions send it
+      file: FileZ.nullable().optional(),
+    }), req.body);
     const q = b.q.trim();
-    const image = checkImage(b.image);
-    if (!q && !image) throw bad('need_input');
+    const images = [...b.images, ...(b.image ? [b.image] : [])].slice(0, 4).map((im) => checkImage(im)!);
+    const file = await checkFile(b.file);
+    if (!q && !images.length && !file) throw bad('need_input');
+
+    // Step 1 — instant, no AI: what the manuals and other technicians already say about this.
     const qq = `${q} ${b.dev}`;
-    const hits = store.index.search(qq, b.dev, 7, 'doc');
+    const hits = store.index.search(qq, b.dev, 8, 'doc');
     // Never suggest a fix that failed for others or that the AI pre-check flagged as dangerous.
     const sols = store.index.search(qq, b.dev, 8, 'sol')
       .filter((e) => solStatus(e.sol) !== 'rej' && !e.sol.ai?.safe)
       .slice(0, 4);
+    const codes = store.index.lookupCodes(q, b.dev);
+    const srcs = hits.map((e) => ({ title: e.doc.title, h: e.doc.chunks[e.ci].h, t: e.doc.chunks[e.ci].t }));
+    const quick = {
+      codes: codes.map((e) => ({ code: e.code, text: e.text, device: e.device, title: e.title })),
+      sols: sols.map((e) => solView(e.sol, c)),
+      docs: srcs.slice(0, 4),
+    };
+    const streaming = wantsStream(req);
 
     if (!AI.aiConfigured()) {
-      res.json({
-        offline: {
-          docs: hits.slice(0, 4).map((e) => ({ title: e.doc.title, h: e.doc.chunks[e.ci].h, t: e.doc.chunks[e.ci].t })),
-          sols: sols.map((e) => solView(e.sol, c)),
-        },
-      });
+      // No AI key on the server: the instant results are the answer.
+      if (!streaming) { res.json({ quick, item: null }); return; }
+      const out = ndjson(res);
+      out.send({ type: 'quick', quick });
+      out.send({ type: 'done', item: null });
+      out.end();
       return;
     }
+
     const plan = PLANS[c.user.plan];
     if (store.usedToday(c.user) >= plan.quota) throw new HttpError(402, 'quota');
-    if (image && !plan.photo) throw new HttpError(402, 'photo_plan');
+    if ((images.length || file) && !plan.photo) throw new HttpError(402, 'photo_plan');
     // "Unlimited" plans still have a ceiling, so a stolen or scripted account can't run up the AI bill.
     limit(`ai:${c.user.id}`, 40, 10 * MIN, 'slow_down');
     limit(`ai-day:${c.user.id}`, 300, DAY, 'slow_down');
 
     // Count the request before the (slow) AI call so parallel requests can't slip past the daily quota.
     c.user.usage.n = store.usedToday(c.user) + 1;
-    let result;
-    try {
-      result = await AI.diagnose(q, b.dev, hits, sols, image, c.lang);
-    } catch (e) {
-      c.user.usage.n = Math.max(0, store.usedToday(c.user) - 1); // failed calls don't use up the quota
-      throw e;
-    }
-    const used = result.community.map((n) => sols[n - 1]).filter(Boolean).map((e) => e.sol.id);
-    const item: HistoryItem = {
-      id: uid(), q, dev: b.dev, date: todayKey(), res: result, done: {}, follow: [],
-      solIds: used.length ? used : sols.slice(0, 2).map((e) => e.sol.id),
-      srcs: hits.map((e) => ({ title: e.doc.title, h: e.doc.chunks[e.ci].h, t: e.doc.chunks[e.ci].t })),
+    const refund = () => { c.user.usage.n = Math.max(0, store.usedToday(c.user) - 1); }; // failed calls don't use up the quota
+    const input: ai.DiagnoseInput = { q, dev: b.dev, hits, sols, codes, images, file, lang: c.lang };
+    const record = (result: Diagnosis) => {
+      const used = result.community.map((n) => sols[n - 1]).filter(Boolean).map((e) => e.sol.id);
+      const item: HistoryItem = {
+        id: uid(), q, dev: b.dev, date: todayKey(), res: result, done: {}, follow: [],
+        solIds: used.length ? used : sols.slice(0, 2).map((e) => e.sol.id),
+        srcs, codes: quick.codes,
+        // Only the fact that something was attached is kept, never the photo or file itself.
+        attached: images.length || file ? { photos: images.length, file: file?.name ?? '' } : undefined,
+      };
+      c.user.history.unshift(item);
+      c.user.history = c.user.history.slice(0, 20);
+      store.save();
+      return historyView(item, c);
     };
-    c.user.history.unshift(item);
-    c.user.history = c.user.history.slice(0, 20);
-    store.save();
-    res.json({ item: historyView(item, c) });
+
+    if (!streaming) {
+      let result: Diagnosis;
+      try { result = await AI.diagnose(input); } catch (e) { refund(); throw e; }
+      res.json({ quick, item: record(result) });
+      return;
+    }
+
+    // Step 2 — streamed: the instant results go out first, then the diagnosis as it is written.
+    const out = ndjson(res);
+    out.send({ type: 'quick', quick });
+    const ctl = new AbortController();
+    res.on('close', () => { if (!res.writableEnded) ctl.abort(); }); // the technician pressed Stop or left the screen
+    try {
+      const result = await AI.diagnose(input, { signal: ctl.signal, onPartial: (partial) => out.send({ type: 'partial', res: partial }) });
+      out.send({ type: 'done', item: record(result) });
+    } catch (e) {
+      refund();
+      if (codeOf(e) === 'generic') console.error('diagnosis failed:', e instanceof Error ? e.message : 'unknown');
+      out.send({ type: 'error', error: codeOf(e) });
+    }
+    out.end();
   }));
 
   r.get('/history', wrap((req, res) => {
@@ -560,11 +681,33 @@ export function createRouter(store: Store, deps: Deps) {
     if (!x) throw notFound();
     const { q } = parse(z.object({ q: z.string().trim().min(1).max(1000) }), req.body);
     if (x.follow.length >= 30) throw bad('invalid_input');
+    if (!AI.aiConfigured()) throw new ai.AiError('not_configured');
     limit(`ai-follow:${c.user.id}`, 60, 10 * MIN, 'slow_down');
-    const a = await AI.followUp(x, q, c.lang);
-    x.follow.push({ q, a });
-    store.save();
-    res.json({ item: historyView(x, c) });
+    const done = (a: string) => {
+      x.follow.push({ q, a });
+      store.save();
+      return historyView(x, c);
+    };
+    if (!wantsStream(req)) { res.json({ item: done(await AI.followUp(x, q, c.lang)) }); return; }
+
+    const out = ndjson(res);
+    const ctl = new AbortController();
+    res.on('close', () => { if (!res.writableEnded) ctl.abort(); });
+    // Pieces arrive word by word; send them a few times a second rather than one line per word.
+    let pending = '';
+    let timer: NodeJS.Timeout | null = null;
+    const flush = () => { timer = null; if (pending) { out.send({ type: 'delta', text: pending }); pending = ''; } };
+    try {
+      const a = await AI.followUp(x, q, c.lang, { signal: ctl.signal, onDelta: (piece) => { pending += piece; timer ??= setTimeout(flush, 80); } });
+      if (timer) clearTimeout(timer);
+      flush();
+      out.send({ type: 'done', item: done(a) });
+    } catch (e) {
+      if (timer) clearTimeout(timer);
+      if (codeOf(e) === 'generic') console.error('follow-up failed:', e instanceof Error ? e.message : 'unknown');
+      out.send({ type: 'error', error: codeOf(e) });
+    }
+    out.end();
   }));
 
   r.patch('/history/:id/steps', wrap((req, res) => {
@@ -842,6 +985,66 @@ export function createRouter(store: Store, deps: Deps) {
 
   /* ================================================================ developer panel (admin token) */
 
+  /** Reading a scanned manual takes minutes; the app starts a job and asks for its progress. */
+  interface Job { status: 'running' | 'done' | 'failed'; done: number; total: number; text: string; error: string; at: number }
+  const jobs = new Map<string, Job>();
+  const PAGES_PER_CALL = 4;
+
+  async function readPdf(job: Job, pdf: PDFDocument, name: string) {
+    const parts: string[] = new Array<string>(job.total).fill('');
+    const all = pdf.getPageIndices();
+    let next = 0;
+    const worker = async () => {
+      while (job.status === 'running') {
+        const n = next++;
+        if (n >= job.total) return;
+        const idx = all.slice(n * PAGES_PER_CALL, (n + 1) * PAGES_PER_CALL);
+        const part = await PDFDocument.create();
+        (await part.copyPages(pdf, idx)).forEach((page) => part.addPage(page));
+        const data = Buffer.from(await part.save()).toString('base64');
+        parts[n] = await AI.transcribePdf(data, `${name} p.${idx[0] + 1}-${idx[idx.length - 1] + 1}`);
+        job.done++;
+      }
+    };
+    try {
+      await Promise.all([worker(), worker()]); // two page groups at a time
+      job.text = parts.filter(Boolean).join('\n\n');
+      job.status = 'done';
+    } catch (e) {
+      job.status = 'failed';
+      job.error = codeOf(e);
+      console.warn('reading a PDF with the AI failed:', e instanceof Error ? e.message : 'unknown');
+    }
+    job.at = Date.now();
+  }
+
+  /**
+   * Background pass over a manual: for every section the AI adds the words a technician would search
+   * with (Turkish and English) and the error codes the section defines. Failure leaves the manual usable.
+   */
+  async function indexDoc(doc: Doc) {
+    if (!AI.aiConfigured() || doc.ai?.status === 'running') return;
+    const state = { status: 'running' as 'running' | 'done' | 'failed', done: 0, total: doc.chunks.length };
+    doc.ai = state;
+    store.save();
+    try {
+      for (let i = 0; i < doc.chunks.length; i += 10) {
+        if (!db().docs.includes(doc)) return; // deleted while indexing
+        const batch = doc.chunks.slice(i, i + 10);
+        const found = await AI.indexSections(doc.title, devOf(doc), batch);
+        batch.forEach((chunk, j) => { chunk.k = found[j]?.keywords || ''; chunk.codes = found[j]?.codes || []; });
+        state.done = Math.min(doc.chunks.length, i + 10);
+        store.reindex();
+        store.save();
+      }
+      state.status = 'done';
+    } catch (e) {
+      state.status = 'failed';
+      console.warn('indexing a manual with the AI failed:', e instanceof Error ? e.message : 'unknown');
+    }
+    store.save();
+  }
+
 
   r.get('/admin/overview', wrap((req, res) => {
     const d = db();
@@ -850,7 +1053,11 @@ export function createRouter(store: Store, deps: Deps) {
       sales: d.sales.slice(0, 20),
       totalSales: d.sales.reduce((a, x) => a + x.usd, 0),
       totalFee: d.sales.reduce((a, x) => a + x.fee, 0),
-      docs: d.docs.map((x) => ({ id: x.id, title: x.title, brand: x.brand, model: x.model, kind: x.kind, chunks: x.chunks.length })),
+      docs: d.docs.map((x) => ({
+        id: x.id, title: x.title, brand: x.brand, model: x.model, kind: x.kind, chunks: x.chunks.length,
+        codes: store.index.codesOf(devOf(x), 500).filter((e) => e.docId === x.id).length, ai: x.ai ?? null,
+      })),
+      ai: AI.aiConfigured(),
       chunkCount: d.docs.reduce((a, x) => a + x.chunks.length, 0),
       solCount: d.sols.length,
       reports: d.reports.length,
@@ -877,7 +1084,17 @@ export function createRouter(store: Store, deps: Deps) {
     db().docs.unshift(doc);
     store.reindex();
     store.save();
+    void indexDoc(doc); // in the background: search words and error codes for every section
     res.json({ id: doc.id, chunks: doc.chunks.length });
+  }));
+
+  // (Re)run the AI indexing pass for a manual, e.g. one that was added before an AI key was configured.
+  r.post('/admin/docs/:id/index', wrap((req, res) => {
+    const doc = db().docs.find((x) => x.id === req.params.id);
+    if (!doc) throw notFound();
+    if (!AI.aiConfigured()) throw new ai.AiError('not_configured');
+    if (doc.ai?.status !== 'running') void indexDoc(doc);
+    res.json({ ok: true });
   }));
 
   // A developer has checked the seller's company and device registration documents.
@@ -910,20 +1127,50 @@ export function createRouter(store: Store, deps: Deps) {
     res.json({ ok: true });
   }));
 
-  r.post('/admin/extract-pdf', body('45mb'), wrap(async (req, res) => {
-    const { data } = parse(z.object({ data: z.string().min(16).max(40_000_000) }), req.body);
-    const parser = new PDFParse({ data: Buffer.from(data, 'base64') });
+  r.post('/admin/ingest-pdf', body('45mb'), wrap(async (req, res) => {
+    const b = parse(z.object({
+      data: z.string().min(16).max(40_000_000).regex(B64), name: z.string().trim().max(200).default('manual'),
+      ai: z.boolean().default(false), // read with the AI even when the PDF has a text layer (tables, diagrams, poor OCR)
+    }), req.body);
+    const bytes = Buffer.from(b.data, 'base64');
+    let pdf: PDFDocument;
+    let pages = 0;
     try {
-      const out = await parser.getText();
-      const text = out.text || '';
-      if (text.replace(/\s/g, '').length < 40) throw bad('pdf_empty');
-      res.json({ text });
-    } catch (e) {
-      if (e instanceof HttpError) throw e;
+      pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
+      if (pdf.isEncrypted) throw new Error('encrypted');
+      pages = pdf.getPageCount(); // throws for a file that is not really a PDF
+    } catch {
       throw bad('pdf_failed');
-    } finally {
-      await parser.destroy();
     }
+    if (pages < 1) throw bad('pdf_failed');
+    if (pages > 600) throw bad('file_too_long');
+
+    // The quick way: the PDF's own text layer.
+    let layer = '';
+    const parser = new PDFParse({ data: bytes });
+    try { layer = (await parser.getText()).text || ''; } catch { layer = ''; } finally { await parser.destroy().catch(() => {}); }
+    const hasText = layer.replace(/\s/g, '').length >= Math.max(40, pages * 120);
+    if ((hasText && !b.ai) || !AI.aiConfigured()) {
+      if (layer.replace(/\s/g, '').length < 40) throw bad('pdf_empty'); // scanned, and no AI to read it
+      res.json({ mode: 'text', pages, text: layer });
+      return;
+    }
+
+    // Scanned or picture-heavy: the AI reads the pages, a few at a time, in the background.
+    for (const [id, j] of jobs) if (j.status !== 'running' && Date.now() - j.at > HOUR) jobs.delete(id);
+    if ([...jobs.values()].filter((j) => j.status === 'running').length >= 2) throw new HttpError(429, 'slow_down');
+    const id = uid();
+    const job: Job = { status: 'running', done: 0, total: Math.ceil(pages / PAGES_PER_CALL), text: '', error: '', at: Date.now() };
+    jobs.set(id, job);
+    audit('admin_pdf_ai_read', { by: req.ctx.user.id, pages });
+    void readPdf(job, pdf, b.name);
+    res.json({ mode: 'ai', pages, job: id });
+  }));
+
+  r.get('/admin/jobs/:id', wrap((req, res) => {
+    const job = jobs.get(String(req.params.id));
+    if (!job) throw notFound();
+    res.json({ status: job.status, done: job.done, total: job.total, text: job.status === 'done' ? job.text : '', error: job.error });
   }));
 
   r.post('/admin/ocr', body('16mb'), wrap(async (req, res) => {

@@ -151,8 +151,9 @@ test('change password needs the current one; delete account removes the user and
 test('diagnose without AI returns offline sources', async () => {
   const { status, json } = await call('POST', '/diagnose', { q: 'Cihaz açılmıyor güç LED yanıp sönüyor', dev: 'Örnek Hasta Monitörü PM-12' });
   assert.equal(status, 200);
-  assert.ok(json.offline.docs.length > 0);
-  assert.ok(json.offline.sols.some((s: any) => s.model === 'Hasta Monitörü PM-12'));
+  assert.equal(json.item, null, 'no AI on the server: the instant results are the answer');
+  assert.ok(json.quick.docs.length > 0);
+  assert.ok(json.quick.sols.some((s: any) => s.model === 'Hasta Monitörü PM-12'));
 });
 
 test('teach, vote and verification reward', async () => {

@@ -8,7 +8,10 @@ import { createRouter, errorHandler, type Deps } from './routes.js';
 import { parseDataKey, Store } from './store.js';
 
 /** Routes that accept large bodies (photos, manuals). Their parser runs after sign-in, inside the router. */
-const LARGE_BODY = new Set(['/api/diagnose', '/api/solutions', '/api/courses', '/api/admin/docs', '/api/admin/extract-pdf', '/api/admin/ocr']);
+const LARGE_BODY = new Set([
+  '/api/diagnose', '/api/identify-device', '/api/solutions', '/api/courses',
+  '/api/admin/docs', '/api/admin/ingest-pdf', '/api/admin/ocr',
+]);
 
 export function createApp(store: Store, deps: Deps) {
   const app = express();
