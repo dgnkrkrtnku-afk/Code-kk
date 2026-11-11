@@ -3,7 +3,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PDFDocument, StandardFonts } from 'pdf-lib';
-import { buildDiagnosisPrompt, normalizeDiagnosis } from '../src/ai.js';
+import { z } from 'zod';
+import { AiError, buildDiagnosisPrompt, normalizeDiagnosis, parseReply, replyText } from '../src/ai.js';
 import { ADMIN, fakeAi, JPEG, makeApp } from './helpers.js';
 
 const PM12 = 'Örnek Hasta Monitörü PM-12';
@@ -340,4 +341,84 @@ test('a failed indexing pass leaves the manual usable', async () => {
   off.store.reindex();
   const t2 = await off.register('dev5@example.com');
   assert.equal((await off.call('POST', '/diagnose', { q: 'tıkanıklık alarmı', dev: 'Acme P2' }, t2)).json.quick.docs[0].h, 'Occlusion alarm', '…but the manual itself is searchable');
+});
+
+test('re-running a failed indexing pass continues with the sections that are still missing', async () => {
+  const { service } = fakeAi();
+  const calls: string[][] = [];
+  let failNext = true;
+  const flaky = {
+    ...service,
+    async indexSections(title: string, device: string, chunks: { h: string; t: string }[]) {
+      calls.push(chunks.map((c) => c.h));
+      // The second batch of the first run fails (for example the API is overloaded).
+      if (calls.length === 2 && failNext) { failNext = false; throw new AiError('generic', 'boom'); }
+      return service.indexSections(title, device, chunks);
+    },
+  };
+  const { call, register, store } = await makeApp(flaky);
+  const t = await register('dev6@example.com');
+  const text = Array.from({ length: 14 }, (_, i) => `# Part ${i + 1}\nGeneral description of assembly number ${i + 1} and its accessories.`).join('\n\n');
+  const added = await call('POST', '/admin/docs', { title: 'Pump manual', brand: 'Acme', model: 'P2', text }, t, ADMIN);
+  const settle = async () => { for (let i = 0; i < 200 && store.db.docs[0].ai?.status === 'running'; i++) await new Promise((r) => setTimeout(r, 5)); };
+  await settle();
+  assert.deepEqual(store.db.docs[0].ai, { status: 'failed', done: 10, total: 14 });
+
+  await call('POST', `/admin/docs/${added.json.id}/index`, {}, t, ADMIN);
+  await settle();
+  assert.deepEqual(store.db.docs[0].ai, { status: 'done', done: 14, total: 14 });
+  assert.deepEqual(calls[2], ['Part 11', 'Part 12', 'Part 13', 'Part 14'], 'only the missing sections are sent again');
+  assert.equal(calls.length, 3);
+});
+
+test('one section the AI cannot index does not spoil the rest of its batch', async () => {
+  const { service } = fakeAi();
+  const sizes: number[] = [];
+  const picky = {
+    ...service,
+    async indexSections(title: string, device: string, chunks: { h: string; t: string }[]) {
+      sizes.push(chunks.length);
+      if (chunks.some((c) => c.h === 'Part 3')) throw new AiError('invalid_json'); // e.g. the answer was cut off
+      return chunks.map(() => ({ keywords: 'sızıntı leak', codes: [] }));
+    },
+  };
+  const { call, register, store } = await makeApp(picky);
+  const t = await register('dev7@example.com');
+  const text = Array.from({ length: 6 }, (_, i) => `# Part ${i + 1}\nGeneral description of assembly number ${i + 1} and its accessories.`).join('\n\n');
+  await call('POST', '/admin/docs', { title: 'Valve manual', brand: 'Acme', model: 'V3', text }, t, ADMIN);
+  for (let i = 0; i < 200 && store.db.docs[0].ai?.status === 'running'; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(store.db.docs[0].ai, { status: 'done', done: 6, total: 6 });
+  assert.deepEqual(store.db.docs[0].chunks.map((c) => c.k), ['sızıntı leak', 'sızıntı leak', '', 'sızıntı leak', 'sızıntı leak', 'sızıntı leak']);
+  assert.deepEqual(sizes, [6, 3, 2, 1, 3], 'the batch is halved until the bad section is alone');
+});
+
+/* ------------------------------------------------------------------ reading the model's answer */
+
+const reply = (stop_reason: string, ...content: unknown[]) => ({ stop_reason, content }) as unknown as Parameters<typeof replyText>[0];
+const textBlock = (text: string) => ({ type: 'text', text });
+const AnswerZ = z.object({ summary: z.string(), steps: z.array(z.string()) });
+
+test('a model answer is parsed and checked; refused or cut-off answers are errors, never half results', () => {
+  assert.deepEqual(parseReply(AnswerZ, reply('end_turn', { type: 'thinking', thinking: '' }, textBlock('{"summary":"ok","steps":["a"]}'))), { summary: 'ok', steps: ['a'] });
+  const code = (fn: () => unknown) => { try { fn(); } catch (e) { return (e as AiError).code; } return 'no error'; };
+  assert.equal(code(() => parseReply(AnswerZ, reply('refusal', textBlock('{"summary":"half')))), 'refused');
+  assert.equal(code(() => parseReply(AnswerZ, reply('max_tokens', textBlock('{"summary":"ok","steps":["a"')))), 'invalid_json');
+  assert.equal(code(() => replyText(reply('max_tokens', textBlock('Page one of the manual says')))), 'invalid_json', 'a cut-off transcript is not stored');
+  assert.equal(code(() => parseReply(AnswerZ, reply('end_turn', textBlock('{"summary":"ok"}')))), 'invalid_json', 'a missing field');
+  assert.equal(code(() => parseReply(AnswerZ, reply('end_turn', textBlock('not json')))), 'invalid_json');
+});
+
+test('an answer finished by the fallback model is read whole, whether it continued or started again', () => {
+  const marker = { type: 'fallback', from: { model: 'a' }, to: { model: 'b' } };
+  // The fallback model continued the half-written document.
+  assert.deepEqual(
+    parseReply(AnswerZ, reply('end_turn', textBlock('{"summary":"ok","ste'), marker, textBlock('ps":["a","b"]}'))),
+    { summary: 'ok', steps: ['a', 'b'] },
+  );
+  // The fallback model started the document again.
+  assert.deepEqual(
+    parseReply(AnswerZ, reply('end_turn', textBlock('{"summary":"first try","ste'), marker, textBlock('{"summary":"second","steps":[]}'))),
+    { summary: 'second', steps: [] },
+  );
+  assert.equal(replyText(reply('end_turn', marker, textBlock('Plain answer.'))).all, 'Plain answer.');
 });

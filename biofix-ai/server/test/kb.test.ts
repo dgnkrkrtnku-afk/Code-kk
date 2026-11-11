@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chunkText, codesInQuery, extractCodes, fold, KnowledgeIndex, sameDevice, solStatus, toks } from '../src/kb.js';
+import { chunkText, codesInQuery, extractCodes, fold, KnowledgeIndex, sameDevice, solStatus, splitLessons, toks } from '../src/kb.js';
 import { SEED_DOCS, SEED_SOLUTIONS } from '../src/seed.js';
 import type { Doc, Solution } from '../src/types.js';
 
@@ -12,6 +12,24 @@ const seedSols = (): Solution[] => SEED_SOLUTIONS.map((s, i) => ({ ...s, id: 's'
 test('chunkText splits on markdown headings', () => {
   const c = chunkText('# A\nbir\n\n# B\niki');
   assert.deepEqual(c.map((x) => x.h), ['A', 'B']);
+});
+
+test('a pasted paragraph without line breaks is cut at sentence ends, so no section is too long to quote in full', () => {
+  const sentence = 'Check the charger board output voltage and replace the fuse if it is open. ';
+  const c = chunkText('# Charging\n' + sentence.repeat(120)); // one line of about 9000 characters
+  assert.ok(c.length > 4);
+  assert.ok(c.every((x) => x.h === 'Charging' && x.t.length <= 2100), `longest: ${Math.max(...c.map((x) => x.t.length))}`);
+  assert.ok(c.every((x) => x.t.endsWith('.')), 'cut between sentences, not inside one');
+  assert.equal(c.map((x) => x.t).join(' ').replace(/\s+/g, ' '), sentence.repeat(120).trim(), 'nothing is lost');
+  // Text with no spaces at all still gets cut.
+  assert.ok(chunkText('x'.repeat(5000)).every((x) => x.t.length <= 2100));
+});
+
+test('training content becomes one lesson per heading, however long a lesson is', () => {
+  const body = 'Kalibrasyon adımları şunlardır. '.repeat(100) + '\n\nİKİNCİ PARAGRAF\n' + 'Ölçüm değerlerini kaydedin. '.repeat(60);
+  const lessons = splitLessons(`Giriş notu\n# Ders 1\n${body}\n\n# Ders 2\nKısa ders.\n# Boş ders\n`);
+  assert.deepEqual(lessons.map((l) => l.h), ['', 'Ders 1', 'Ders 2']);
+  assert.ok(lessons[1].t.length > 4000 && lessons[1].t.includes('İKİNCİ PARAGRAF'), 'not cut by length or by a line in capitals');
 });
 
 test('text is folded: Turkish letters, upper case and the dotless i all compare equal', () => {

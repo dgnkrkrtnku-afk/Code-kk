@@ -24,7 +24,7 @@ export const EXTRA = {
     a_label_none: 'Etiket okunamadı. Daha yakından ve net bir fotoğraf çek.',
     a_photos_max: 'En çok 4 fotoğraf eklenebilir.', a_file_big: 'Dosya çok büyük (en çok yaklaşık 8 MB).',
     e_file_unreadable: 'Dosya okunamadı. Şifresiz bir PDF ya da düz metin dosyası ekle.',
-    e_file_long: 'Dosya çok uzun. PDF için en çok 30 sayfa; kılavuzun yalnızca ilgili bölümünü ekle.',
+    e_file_long: 'Dosya çok uzun. Kılavuzun tamamını değil, yalnızca arızayla ilgili sayfalarını ekle.',
     // developer panel: reading manuals
     k_pdf_ai: 'PDF’i AI ile oku', k_pdf_ai_d: '“Dosya seç” taranmış sayfaları kendiliğinden AI ile okur. Bu düğme ise metni olan ama tablo ve şemaları eksik çıkan bir kılavuzun tümünü AI’a okutur; sayfa sayısına göre birkaç dakika sürebilir.',
     k_reading_ai: 'AI sayfaları okuyor: {0} / {1}', k_job_failed: 'AI okuması tamamlanamadı. Yeniden dene.',
@@ -109,7 +109,7 @@ export const EXTRA = {
     a_label_none: 'The label could not be read. Take a closer, sharper photo.',
     a_photos_max: 'You can attach up to 4 photos.', a_file_big: 'The file is too large (about 8 MB at most).',
     e_file_unreadable: 'The file could not be read. Attach an unprotected PDF or a plain text file.',
-    e_file_long: 'The file is too long. PDFs can have up to 30 pages; attach only the relevant part of the manual.',
+    e_file_long: 'The file is too long. Attach only the pages that matter for this fault, not the whole manual.',
     k_pdf_ai: 'Read PDF with AI', k_pdf_ai_d: '“Choose file” already reads scanned pages with the AI by itself. This button has the AI read the whole of a manual that has text but whose tables and diagrams come out incomplete; it can take a few minutes depending on the page count.',
     k_reading_ai: 'The AI is reading pages: {0} / {1}', k_job_failed: 'The AI could not finish reading. Try again.',
     k_pages: 'Page photos (from gallery)', k_ocr_n: 'Reading page: {0} / {1}',

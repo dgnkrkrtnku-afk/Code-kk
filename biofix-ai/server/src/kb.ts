@@ -3,6 +3,25 @@
 import type { Chunk, Doc, Solution, SolStatus } from './types.js';
 
 /** Split manual text into sections by markdown, numbered or ALL-CAPS headings. */
+/** Longest line kept in one piece. With it no section grows past about 2000 characters, which the AI prompts quote in full. */
+const MAX_LINE = 900;
+
+/** Cut a very long line (a pasted paragraph without line breaks) at sentence ends, or failing that at spaces. */
+function wrapLong(line: string): string[] {
+  const out: string[] = [];
+  let rest = line;
+  while (rest.length > MAX_LINE) {
+    const head = rest.slice(0, MAX_LINE);
+    const sentence = Math.max(head.lastIndexOf('. '), head.lastIndexOf('; '), head.lastIndexOf('! '), head.lastIndexOf('? '));
+    const space = head.lastIndexOf(' ');
+    const cut = sentence > MAX_LINE / 3 ? sentence + 1 : space > MAX_LINE / 3 ? space : MAX_LINE;
+    out.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+  }
+  if (rest) out.push(rest);
+  return out;
+}
+
 export function chunkText(text: string): Chunk[] {
   const out: Chunk[] = [];
   let h = '';
@@ -12,7 +31,8 @@ export function chunkText(text: string): Chunk[] {
     if (s) out.push({ h, t: s });
     buf = '';
   };
-  for (const raw of String(text).replace(/\r/g, '').split('\n')) {
+  const lines = String(text).replace(/\r/g, '').split('\n').flatMap((raw) => (raw.length > MAX_LINE ? wrapLong(raw.trim()) : [raw]));
+  for (const raw of lines) {
     const l = raw.trim();
     const md = /^#{1,4}\s+\S/.test(l);
     const num = /^\d+(\.\d+)+\.?\s+\S.{2,70}$/.test(l) && !/[.:;,]$/.test(l);
@@ -29,6 +49,29 @@ export function chunkText(text: string): Chunk[] {
     }
     buf += l + '\n';
     if (buf.length > 1100) flush();
+  }
+  flush();
+  return out;
+}
+
+/** Training content → lessons: one per "# heading". Unlike a manual section, a lesson is never cut by length. */
+export function splitLessons(text: string): Chunk[] {
+  const out: Chunk[] = [];
+  let h = '';
+  let lines: string[] = [];
+  const flush = () => {
+    const t = lines.join('\n').trim();
+    if (t) out.push({ h, t });
+    lines = [];
+  };
+  for (const raw of String(text).replace(/\r/g, '').split('\n')) {
+    const l = raw.trim();
+    if (/^#{1,4}\s+\S/.test(l)) {
+      flush();
+      h = l.replace(/^#+\s*/, '').slice(0, 90);
+    } else {
+      lines.push(raw);
+    }
   }
   flush();
   return out;

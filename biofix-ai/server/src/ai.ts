@@ -9,14 +9,22 @@ import { parsePartialJson } from './partial-json.js';
 import type { AiCheck, Chunk, Diagnosis, HistoryItem, Lang, Solution } from './types.js';
 
 export const MODEL = process.env.BIOFIX_MODEL || 'claude-opus-5-5';
-const BETAS = ['server-side-fallback-2026-07-01'];
+/**
+ * Models whose safety classifiers can decline a request and that accept a server-side fallback:
+ * the API then re-runs the request on its recommended fallback model inside the same call.
+ */
+const HAS_FALLBACK = /^claude-(fable-5-[12]|opus-5(-5)?|sonnet-5-5)$/.test(MODEL);
+/** Models with a fast output mode that needs no beta flag. */
+const HAS_FAST_MODE = /^claude-(opus-5-5|fable-5-2)$/.test(MODEL);
+/** Room for the answer and the model's thinking. Only what is used is billed. */
+const MAX_TOKENS = 64000;
 
 type Effort = 'low' | 'medium' | 'high';
 /** Thinking depth for the diagnosis itself. Lower is faster and cheaper; "high" is the careful default. */
 export const diagnosisEffort = (): Effort =>
   (['low', 'medium', 'high'] as const).find((e) => e === process.env.BIOFIX_EFFORT) ?? 'high';
 /** BIOFIX_SPEED=fast asks for the model's fast output mode (quicker answers at a higher price per token). */
-const fastMode = () => process.env.BIOFIX_SPEED === 'fast';
+const fastMode = () => process.env.BIOFIX_SPEED === 'fast' && HAS_FAST_MODE;
 
 let client: Anthropic | null = null;
 const api = () => (client ??= new Anthropic());
@@ -58,7 +66,8 @@ interface CallOptions {
   images?: ImageInput[];
   pdf?: { name: string; data: string } | null;
   signal?: AbortSignal;
-  maxTokens?: number;
+  /** Background work (reading and indexing manuals) waits out a busy API; a technician at a device is not kept waiting. */
+  patient?: boolean;
 }
 
 function userContent(prompt: string, o: CallOptions): Anthropic.Beta.BetaContentBlockParam[] {
@@ -89,51 +98,89 @@ function mapError(e: unknown): never {
 }
 
 /** Request fields shared by every call. */
-function baseParams(prompt: Prompt, o: CallOptions) {
+function baseParams(prompt: Prompt, o: CallOptions, fast: boolean) {
   return {
     model: MODEL,
-    max_tokens: o.maxTokens ?? 32000,
-    betas: BETAS,
-    // If a safety classifier declines the request, the API retries it on its recommended fallback model.
-    fallbacks: 'default' as const,
-    ...(fastMode() ? { speed: 'fast' as const } : {}),
+    max_tokens: MAX_TOKENS,
+    ...(HAS_FALLBACK ? { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' as const } : {}),
+    ...(fast ? { speed: 'fast' as const } : {}),
     system: prompt.system,
     messages: [{ role: 'user' as const, content: userContent(prompt.user, o) }],
   };
+}
+
+const requestOptions = (o: CallOptions) => ({ signal: o.signal, ...(o.patient ? { maxRetries: 5 } : {}) });
+
+/**
+ * Send one request and map its errors. Fast mode has its own, smaller rate limit:
+ * when that is exhausted the request is sent once more at normal speed instead of failing.
+ */
+async function run<T>(send: (fast: boolean) => Promise<T>): Promise<T> {
+  if (!aiConfigured()) throw new AiError('not_configured');
+  try {
+    try {
+      return await send(fastMode());
+    } catch (e) {
+      if (!(fastMode() && e instanceof Anthropic.RateLimitError)) throw e;
+      return await send(false);
+    }
+  } catch (e) {
+    mapError(e);
+  }
+}
+
+type Reply = Pick<Anthropic.Beta.BetaMessage, 'stop_reason' | 'content'>;
+
+/** The text of a finished answer. Refusals and answers cut off at the output limit are errors, never partial results. */
+export function replyText(res: Reply): { all: string; afterFallback: string } {
+  if (res.stop_reason === 'refusal') throw new AiError('refused');
+  if (res.stop_reason === 'max_tokens' || res.stop_reason === 'model_context_window_exceeded') throw new AiError('invalid_json', 'the answer was cut off');
+  // When the fallback model takes over half-way, the answer arrives as text, a "fallback" marker, more text.
+  const lastSwitch = res.content.map((b) => b.type as string).lastIndexOf('fallback');
+  const textOf = (blocks: Reply['content']) => blocks.flatMap((b) => (b.type === 'text' ? [b.text] : [])).join('');
+  return { all: textOf(res.content), afterFallback: textOf(res.content.slice(lastSwitch + 1)) };
+}
+
+/** Parse a JSON answer and check it against the schema. */
+export function parseReply<S extends z.ZodType>(schema: S, res: Reply): z.infer<S> {
+  const { all, afterFallback } = replyText(res);
+  // Normally the whole text is the document; after a switch of model it may be only the part after the switch.
+  for (const candidate of all === afterFallback ? [all] : [all, afterFallback]) {
+    let value: unknown;
+    try { value = JSON.parse(candidate); } catch { continue; }
+    const checked = schema.safeParse(value);
+    if (checked.success) return checked.data;
+  }
+  throw new AiError('invalid_json');
 }
 
 /** A JSON answer checked against `schema`. `onSnapshot` receives the raw text written so far. */
 async function structured<S extends z.ZodType>(
   schema: S, prompt: Prompt, o: CallOptions, onSnapshot?: (text: string) => void,
 ): Promise<z.infer<S>> {
-  if (!aiConfigured()) throw new AiError('not_configured');
-  try {
+  // Only the JSON schema is sent; the answer is parsed here (see parseReply) rather than by the SDK,
+  // which reads one text block at a time and throws on an answer that was refused or cut off half-way.
+  const { type, schema: jsonSchema } = betaZodOutputFormat(schema);
+  const res = await run((fast) => {
     const stream = api().beta.messages.stream({
-      ...baseParams(prompt, o),
-      output_config: { effort: o.effort, format: betaZodOutputFormat(schema) },
-    }, { signal: o.signal });
-    if (onSnapshot) stream.on('text', (_delta, snapshot) => onSnapshot(snapshot));
-    const res = await stream.finalMessage();
-    if (res.stop_reason === 'refusal') throw new AiError('refused');
-    if (res.parsed_output == null) throw new AiError('invalid_json');
-    return res.parsed_output as z.infer<S>;
-  } catch (e) {
-    mapError(e);
-  }
+      ...baseParams(prompt, o, fast),
+      output_config: { effort: o.effort, format: { type, schema: jsonSchema } },
+    }, requestOptions(o));
+    let written = '';
+    if (onSnapshot) stream.on('text', (delta) => { written += delta; onSnapshot(written); });
+    return stream.finalMessage();
+  });
+  return parseReply(schema, res);
 }
 
 /** A plain-text answer. `onDelta` receives each new piece as it is written. */
 async function text(prompt: Prompt, o: CallOptions, onDelta?: (piece: string) => void): Promise<string> {
-  if (!aiConfigured()) throw new AiError('not_configured');
-  try {
-    const stream = api().beta.messages.stream({ ...baseParams(prompt, o), output_config: { effort: o.effort } }, { signal: o.signal });
+  const res = await run((fast) => {
+    const stream = api().beta.messages.stream({ ...baseParams(prompt, o, fast), output_config: { effort: o.effort } }, requestOptions(o));
     if (onDelta) stream.on('text', (delta) => onDelta(delta));
-    const res = await stream.finalMessage();
-    if (res.stop_reason === 'refusal') throw new AiError('refused');
-    return res.content.flatMap((b) => (b.type === 'text' ? [b.text] : [])).join('').trim();
-  } catch (e) {
-    mapError(e);
-  }
+    return stream.finalMessage();
+  });
+  return replyText(res).all.trim();
 }
 
 /* ------------------------------------------------------------------ diagnosis */
@@ -334,7 +381,7 @@ export async function identifyDevice(image: ImageInput, known: string[]): Promis
       + '- "serial": the serial number if legible, else null.\n'
       + '- "match": the number of the entry in <known_devices> that is the same manufacturer and model, or null when none is. A different model of the same family is not a match.',
     user: `<known_devices>\n${known.map((d, i) => `${i + 1}. ${untrusted(d)}`).join('\n') || '(none)'}\n</known_devices>`,
-  }, { effort: 'low', images: [image], maxTokens: 4000 });
+  }, { effort: 'low', images: [image] });
   return {
     brand: (r.brand || '').slice(0, 80), model: (r.model || '').slice(0, 120), serial: (r.serial || '').slice(0, 80),
     device: r.match && r.match >= 1 && r.match <= known.length ? known[r.match - 1] : '',
@@ -352,14 +399,14 @@ const TRANSCRIBE_RULES = 'Transcribe all readable text exactly, in its original 
 
 /** One photographed manual page → text. */
 export async function transcribePage(image: ImageInput): Promise<string> {
-  return text({ system: TRANSCRIBE_SYSTEM, user: `This image is one page. ${TRANSCRIBE_RULES}` }, { effort: 'low', images: [image] });
+  return text({ system: TRANSCRIBE_SYSTEM, user: `This image is one page. ${TRANSCRIBE_RULES}` }, { effort: 'low', images: [image], patient: true });
 }
 
 /** A (possibly scanned) PDF of a few pages → text. Claude reads both the text layer and the page images. */
 export async function transcribePdf(pdfBase64: string, name: string): Promise<string> {
   return text(
     { system: TRANSCRIBE_SYSTEM, user: `The attached PDF is a consecutive group of pages from one manual. ${TRANSCRIBE_RULES}` },
-    { effort: 'low', pdf: { name, data: pdfBase64 }, maxTokens: 48000 },
+    { effort: 'low', pdf: { name, data: pdfBase64 }, patient: true },
   );
 }
 
@@ -390,9 +437,9 @@ export async function indexSections(title: string, device: string, chunks: Chunk
       + 'Do not repeat words that are already in the section text. Empty string for sections with no troubleshooting value (cover page, legal text, table of contents).\n'
       + '- "codes": every error, alarm or status code the section defines, with "code" exactly as printed and "text" its meaning and remedy as the section states them, in the section\'s language (at most 300 characters). Empty list when it defines none. Do not list part numbers, test points or component designators.',
     user: `<device>${untrusted(device) || '(not specified)'} — ${untrusted(title)}</device>\n\n<sections>\n`
-      + chunks.map((c, i) => `[${i + 1}] ${untrusted(c.h)}\n${untrusted(c.t.slice(0, 1800))}`).join('\n\n')
+      + chunks.map((c, i) => `[${i + 1}] ${untrusted(c.h)}\n${untrusted(c.t.slice(0, 2400))}`).join('\n\n')
       + '\n</sections>',
-  }, { effort: 'low', maxTokens: 16000 });
+  }, { effort: 'low', patient: true });
   return chunks.map((_, i) => {
     const s = r.sections.find((x) => x.n === i + 1);
     return {

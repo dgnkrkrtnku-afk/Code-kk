@@ -12,13 +12,13 @@ import {
 import { Billing, PLAY_BASE_PLANS, PLAY_SUBSCRIPTIONS, POINT_PACKS, type PlayNotification } from './billing.js';
 import { adminToken, demoPayments, rtdnSecret } from './config.js';
 import { bad, forbidden, HttpError, notFound } from './errors.js';
-import { chunkText, devOf, NEED_OK, prefixMatchCount, sameDevice, solStatus } from './kb.js';
+import { chunkText, devOf, NEED_OK, prefixMatchCount, sameDevice, solStatus, splitLessons } from './kb.js';
 import type { Mailer } from './mailer.js';
 import { isPlan, PLANS, planForClient, planPrice, PT, PT_PER_USD, ptsFor } from './plans.js';
 import type { PlayClient } from './play.js';
 import { COUNTRIES } from './seed.js';
 import { todayKey, uid, type Store } from './store.js';
-import type { Course, Diagnosis, Doc, HistoryItem, Lang, Listing, Solution, User } from './types.js';
+import type { Chunk, Course, Diagnosis, Doc, HistoryItem, Lang, Listing, Solution, User } from './types.js';
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -73,6 +73,7 @@ async function checkFile(f: z.infer<typeof FileZ> | null | undefined): Promise<a
     } catch {
       throw bad('file_unreadable');
     }
+    if (pages < 1) throw bad('file_unreadable');
     if (pages > MAX_ATTACH_PAGES) throw bad('file_too_long');
     return { kind: 'pdf', name, data: f.data };
   }
@@ -821,7 +822,7 @@ export function createRouter(store: Store, deps: Deps) {
       hours: z.number().int().min(1).max(500), usd: z.number().positive().max(100000),
       desc: z.string().trim().max(3000).default(''), lessonsText: z.string().max(200000),
     }), req.body);
-    const lessons = chunkText(b.lessonsText).map((x, i) => ({ t: x.h || `${c.lang === 'tr' ? 'Ders' : 'Lesson'} ${i + 1}`, c: x.t }));
+    const lessons = splitLessons(b.lessonsText).map((x, i) => ({ t: x.h || `${c.lang === 'tr' ? 'Ders' : 'Lesson'} ${i + 1}`, c: x.t }));
     if (!lessons.length) throw bad('need_lessons');
     const co: Course = {
       id: uid(), ownerId: c.user.id, title: b.title, by: displayName(c), cat: b.cat, level: b.level, hours: b.hours,
@@ -1047,21 +1048,39 @@ export function createRouter(store: Store, deps: Deps) {
   }
 
   /**
+   * Search words and error codes for a batch of sections. When the answer for a whole batch cannot be
+   * used (cut off, malformed), the batch is halved until the troublesome section is alone and is left as it is.
+   */
+  async function indexBatch(doc: Doc, batch: Chunk[]): Promise<void> {
+    try {
+      const found = await AI.indexSections(doc.title, devOf(doc), batch);
+      batch.forEach((chunk, j) => { chunk.k = found[j]?.keywords || ''; chunk.codes = found[j]?.codes || []; });
+    } catch (e) {
+      if (!(e instanceof ai.AiError) || e.code !== 'invalid_json') throw e;
+      if (batch.length === 1) { batch[0].k = ''; batch[0].codes = []; return; }
+      const half = Math.ceil(batch.length / 2);
+      await indexBatch(doc, batch.slice(0, half));
+      await indexBatch(doc, batch.slice(half));
+    }
+  }
+
+  /**
    * Background pass over a manual: for every section the AI adds the words a technician would search
-   * with (Turkish and English) and the error codes the section defines. Failure leaves the manual usable.
+   * with (Turkish and English) and the error codes the section defines. Failure leaves the manual usable,
+   * and running the pass again continues with the sections that are still missing.
    */
   async function indexDoc(doc: Doc) {
     if (!AI.aiConfigured() || doc.ai?.status === 'running') return;
-    const state = { status: 'running' as 'running' | 'done' | 'failed', done: 0, total: doc.chunks.length };
+    const todo = doc.chunks.filter((chunk) => chunk.k === undefined);
+    const already = doc.chunks.length - todo.length;
+    const state = { status: 'running' as 'running' | 'done' | 'failed', done: already, total: doc.chunks.length };
     doc.ai = state;
     store.save();
     try {
-      for (let i = 0; i < doc.chunks.length; i += 10) {
+      for (let i = 0; i < todo.length; i += 10) {
         if (!db().docs.includes(doc)) return; // deleted while indexing
-        const batch = doc.chunks.slice(i, i + 10);
-        const found = await AI.indexSections(doc.title, devOf(doc), batch);
-        batch.forEach((chunk, j) => { chunk.k = found[j]?.keywords || ''; chunk.codes = found[j]?.codes || []; });
-        state.done = Math.min(doc.chunks.length, i + 10);
+        await indexBatch(doc, todo.slice(i, i + 10));
+        state.done = already + Math.min(todo.length, i + 10);
         store.reindex();
         store.save();
       }
