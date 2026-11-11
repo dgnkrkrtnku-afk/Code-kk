@@ -10,7 +10,13 @@ import { SEED_COURSES, SEED_DOCS, SEED_LISTINGS, SEED_REVIEWS, SEED_SOLUTIONS } 
 import type { Db, User } from './types.js';
 
 export const uid = () => randomUUID().replace(/-/g, '').slice(0, 16);
-export const todayKey = () => new Date().toISOString().slice(0, 10);
+/** The calendar the daily allowances and the dates shown to users follow (IANA name, e.g. Europe/Istanbul). */
+const dayFormat = (() => {
+  const make = (timeZone: string) => new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' });
+  try { return make(process.env.APP_TIMEZONE || 'Europe/Istanbul'); } catch { return make('UTC'); }
+})();
+/** Today's date as YYYY-MM-DD where the users are, so "today's" allowance does not roll over at 03:00 at night. */
+export const todayKey = (now: Date | number = Date.now()) => dayFormat.format(now);
 
 function seedDb(): Db {
   return {
@@ -68,7 +74,10 @@ function decrypt(file: Buffer, key: Buffer): Buffer {
 
 export class Store {
   db: Db;
-  readonly index = new KnowledgeIndex();
+  private readonly kb = new KnowledgeIndex();
+  private stale = true;
+  /** Changes whenever manuals or solutions change; cached answers made from older knowledge are not reused. */
+  kbVersion = 0;
   private timer: NodeJS.Timeout | null = null;
 
   /** @param key 32-byte key; when given, the file is encrypted with AES-256-GCM. */
@@ -106,8 +115,27 @@ export class Store {
     return db;
   }
 
+  /**
+   * The search index over manuals and solutions. Rebuilding reads every section again, so it is put off
+   * until the next search: a burst of changes (indexing a manual, a run of new solutions) costs one rebuild.
+   */
+  get index(): KnowledgeIndex {
+    if (this.stale) {
+      this.kb.rebuild(this.db.docs, this.db.sols);
+      this.stale = false;
+    }
+    return this.kb;
+  }
+
+  /** Call after manuals or solutions change. */
   reindex() {
-    this.index.rebuild(this.db.docs, this.db.sols);
+    this.stale = true;
+    this.kbVersion++;
+  }
+
+  /** Call when what the AI is told changed but the searchable text did not (a vote, a solution cleared by a developer). */
+  touchKb() {
+    this.kbVersion++;
   }
 
   /** Debounced write so bursts of changes cost one disk write. */
@@ -143,7 +171,8 @@ export class Store {
     }
     // An account whose address was never proven holds no rights; after a week it is removed.
     for (const u of Object.values(this.db.users)) {
-      if (!u.emailVerified && u.email && now - Date.parse(u.createdAt) > UNVERIFIED_KEEP_MS) { this.deleteUser(u.id); changed = true; }
+      // Only registrations made since verification exists (`false`); older accounts (no value) verify at their next sign-in.
+      if (u.emailVerified === false && u.email && now - Date.parse(u.createdAt) > UNVERIFIED_KEEP_MS) { this.deleteUser(u.id); changed = true; }
     }
     if (changed) this.save();
   }

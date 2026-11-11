@@ -68,7 +68,7 @@ export async function makeApp(ai?: AiService, store = new Store(null), play: Pla
 }
 
 export const diagnosis: Diagnosis = {
-  summary: 'Güç kartı arızası olası.', firstAction: 'TP2 noktasını ölç.', confidence: 'medium', grounded: true,
+  summary: 'Güç kartı arızası olası.', firstAction: 'TP2 noktasını ölç.', findings: [], confidence: 'medium', grounded: true,
   causes: [], steps: [], parts: [], warnings: [], questions: [], community: [],
 };
 

@@ -83,8 +83,16 @@ test('uploads must really be images, and a solution cannot carry a remote image 
   const tracked = await call('POST', '/solutions', solution({ photoPreview: 'https://tracker.example/pixel.png' }), t);
   assert.equal(tracked.status, 200);
   assert.equal(tracked.json.item.photo, '', 'client-supplied preview is ignored');
+  assert.equal(tracked.json.item.hasPhoto, false);
   const real = await call('POST', '/solutions', solution({ symptom: 'Gerçek fotoğraflı arıza', photo: { data: JPEG, mediaType: 'image/jpeg' } }), t);
-  assert.ok(real.json.item.photo.startsWith('data:image/jpeg;base64,/9j/'));
+  // Lists and cards carry no picture data; the photo is fetched when a card is opened.
+  assert.deepEqual([real.json.item.photo, real.json.item.hasPhoto], ['', true]);
+  const list = await call('GET', '/solutions?tab=mine', undefined, t);
+  assert.ok(list.text.length < 5000 && !list.text.includes('/9j/'), 'no photo data in the list');
+  const photo = await call('GET', `/solutions/${real.json.item.id}/photo`, undefined, t);
+  assert.ok(photo.json.photo.startsWith('data:image/jpeg;base64,/9j/'));
+  assert.equal((await call('GET', `/solutions/${real.json.item.id}/photo`)).status, 401, 'signed-in users only');
+  assert.equal((await call('GET', '/solutions/nope/photo', undefined, t)).status, 404);
 });
 
 test('display names cannot contain markup or control characters', async () => {
@@ -303,14 +311,15 @@ test('parallel requests cannot exceed the daily AI quota, and failed calls are n
   const { service, seen } = fakeAi({ fail: () => failNext, delayMs: 30 });
   const { call, register } = await makeApp(service);
   const t = await register('quota@example.com');
-  const results = await Promise.all(Array.from({ length: 12 }, () => call('POST', '/diagnose', { q: 'Cihaz açılmıyor' }, t)));
+  // Twelve different faults at once (an identical one would be answered from the stored answer, free of charge).
+  const results = await Promise.all(Array.from({ length: 12 }, (_, i) => call('POST', '/diagnose', { q: `Cihaz açılmıyor, deneme ${i + 1}` }, t)));
   assert.equal(results.filter((r) => r.status === 200).length, 5, 'free plan: five a day');
   assert.equal(results.filter((r) => r.json?.error === 'quota').length, 7);
   assert.equal(seen.calls, 5, 'the AI was only called for requests inside the quota');
 
   const t2 = await register('quota2@example.com');
   failNext = true;
-  assert.equal((await call('POST', '/diagnose', { q: 'Cihaz açılmıyor' }, t2)).status, 502);
+  assert.equal((await call('POST', '/diagnose', { q: 'Ekran titriyor ve kararıyor' }, t2)).status, 502);
   failNext = false;
   assert.equal((await call('GET', '/me', undefined, t2)).json.user.usedToday, 0);
 });

@@ -4,27 +4,48 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { betaZodOutputFormat } from '@anthropic-ai/sdk/helpers/beta/zod';
 import { z } from 'zod';
-import { devOf, solStatus, type CodeEntry, type DocHit, type SolHit } from './kb.js';
+import { devOf, sameDevice, solStatus, type CodeEntry, type DocHit, type SolHit } from './kb.js';
 import { parsePartialJson } from './partial-json.js';
-import type { AiCheck, Chunk, Diagnosis, HistoryItem, Lang, Solution } from './types.js';
+import type { AiCheck, Chunk, Diagnosis, Finding, HistoryItem, Lang, Solution } from './types.js';
 
 export const MODEL = process.env.BIOFIX_MODEL || 'claude-opus-5-5';
+/**
+ * Optional lighter model for the jobs that copy or label rather than reason: reading a device label,
+ * transcribing manual pages, indexing manuals. Unset, everything runs on MODEL.
+ */
+export const LIGHT_MODEL = process.env.BIOFIX_LIGHT_MODEL || MODEL;
 /**
  * Models whose safety classifiers can decline a request and that accept a server-side fallback:
  * the API then re-runs the request on its recommended fallback model inside the same call.
  */
-const HAS_FALLBACK = /^claude-(fable-5-[12]|opus-5(-5)?|sonnet-5-5)$/.test(MODEL);
+const hasFallback = (model: string) => /^claude-(fable-5-[12]|opus-5(-5)?|sonnet-5-5)$/.test(model);
 /** Models with a fast output mode that needs no beta flag. */
-const HAS_FAST_MODE = /^claude-(opus-5-5|fable-5-2)$/.test(MODEL);
+const hasFastMode = (model: string) => /^claude-(opus-5-5|fable-5-2)$/.test(model);
 /** Room for the answer and the model's thinking. Only what is used is billed. */
 const MAX_TOKENS = 64000;
+/** How long a technician is kept waiting for one answer before the call is given up (seconds, BIOFIX_AI_TIMEOUT_S). */
+const answerTimeoutMs = () => (Number(process.env.BIOFIX_AI_TIMEOUT_S) || 240) * 1000;
+/** Background work on manuals may take its time. */
+const PATIENT_TIMEOUT_MS = 15 * 60 * 1000;
 
 type Effort = 'low' | 'medium' | 'high';
-/** Thinking depth for the diagnosis itself. Lower is faster and cheaper; "high" is the careful default. */
-export const diagnosisEffort = (): Effort =>
-  (['low', 'medium', 'high'] as const).find((e) => e === process.env.BIOFIX_EFFORT) ?? 'high';
+const effortSetting = (): Effort | 'auto' =>
+  (['low', 'medium', 'high', 'auto'] as const).find((e) => e === process.env.BIOFIX_EFFORT) ?? 'high';
+/**
+ * Thinking depth for a diagnosis. BIOFIX_EFFORT fixes it (default "high", the careful setting).
+ * With "auto", a fault the knowledge base already answers - the manual explains the code that was
+ * reported, or a verified fix exists for this very device - gets "medium", which is quicker;
+ * anything open-ended, and anything with photos or a file to study, stays at "high".
+ */
+export function diagnosisEffort(i?: Pick<DiagnoseInput, 'codes' | 'sols' | 'images' | 'file' | 'dev'>): Effort {
+  const setting = effortSetting();
+  if (setting !== 'auto') return setting;
+  if (!i || i.images.length || i.file) return 'high';
+  const verifiedHere = i.sols.some((e) => solStatus(e.sol) === 'ver' && (!i.dev || sameDevice(devOf(e.sol), i.dev)));
+  return i.codes.length || verifiedHere ? 'medium' : 'high';
+}
 /** BIOFIX_SPEED=fast asks for the model's fast output mode (quicker answers at a higher price per token). */
-const fastMode = () => process.env.BIOFIX_SPEED === 'fast' && HAS_FAST_MODE;
+const fastMode = (model: string) => process.env.BIOFIX_SPEED === 'fast' && hasFastMode(model);
 
 let client: Anthropic | null = null;
 const api = () => (client ??= new Anthropic());
@@ -34,7 +55,12 @@ export const aiConfigured = () =>
   !!(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_PROFILE);
 
 export type AiErrorCode =
-  | 'not_configured' | 'rate_limited' | 'refused' | 'invalid_json' | 'prompt_too_large' | 'image_rejected' | 'cancelled' | 'generic';
+  | 'not_configured' | 'rate_limited' | 'refused' | 'invalid_json' | 'prompt_too_large' | 'image_rejected' | 'cancelled'
+  /** The AI service is overloaded or unreachable right now. */
+  | 'busy'
+  /** No answer within the time allowed. */
+  | 'timeout'
+  | 'generic';
 export class AiError extends Error {
   constructor(public code: AiErrorCode, message?: string) {
     super(message || code);
@@ -50,7 +76,7 @@ const langName = (l: Lang) => (l === 'tr' ? 'Turkish' : 'English');
 /** Instructions go in `system`; everything users or manual authors wrote goes in the user turn as tagged data. */
 export interface Prompt { system: string; user: string }
 
-const TAGS = 'manual_sources|community_solutions|error_codes|device|fault_report|attached_file|earlier_diagnosis|earlier_follow_ups|question|manual_excerpts|submission|known_devices|sections';
+const TAGS = 'manual_sources|community_solutions|error_codes|device|fault_report|attached_file|data_summary|measurements|earlier_diagnosis|earlier_follow_ups|question|manual_excerpts|submission|known_devices|sections';
 /**
  * Text that came from users (fault reports, taught solutions, attached files) or uploaded manuals.
  * Removing our block tags from it means it cannot close its block and pose as instructions.
@@ -68,6 +94,8 @@ interface CallOptions {
   signal?: AbortSignal;
   /** Background work (reading and indexing manuals) waits out a busy API; a technician at a device is not kept waiting. */
   patient?: boolean;
+  /** Defaults to MODEL. */
+  model?: string;
 }
 
 function userContent(prompt: string, o: CallOptions): Anthropic.Beta.BetaContentBlockParam[] {
@@ -86,6 +114,7 @@ function mapError(e: unknown): never {
   if (e instanceof AiError) throw e;
   if (e instanceof Anthropic.APIUserAbortError) throw new AiError('cancelled');
   if (e instanceof Anthropic.RateLimitError) throw new AiError('rate_limited');
+  if (e instanceof Anthropic.ContentTooLargeError) throw new AiError('prompt_too_large');
   if (e instanceof Anthropic.BadRequestError) {
     const msg = String(e.message || '');
     if (/too long|too large|maximum context|too many pages/i.test(msg)) throw new AiError('prompt_too_large');
@@ -93,39 +122,56 @@ function mapError(e: unknown): never {
     throw new AiError('generic', msg);
   }
   if (e instanceof Anthropic.AuthenticationError || e instanceof Anthropic.PermissionDeniedError) throw new AiError('not_configured');
-  if (e instanceof Anthropic.APIError) throw new AiError('generic', `${e.status} ${e.message}`);
+  if (e instanceof Anthropic.NotFoundError) throw new AiError('not_configured', `the model "${MODEL}" or "${LIGHT_MODEL}" is not available to this API key`);
+  // Overloaded, a server error or no connection: nothing is wrong with the request, the service is busy.
+  if (e instanceof Anthropic.APIConnectionError || e instanceof Anthropic.InternalServerError) throw new AiError('busy', e.message);
+  if (e instanceof Anthropic.APIError) throw new AiError(e.status === undefined ? 'busy' : 'generic', `${e.status} ${e.message}`);
   throw new AiError('generic', e instanceof Error ? e.message : String(e));
 }
 
 /** Request fields shared by every call. */
 function baseParams(prompt: Prompt, o: CallOptions, fast: boolean) {
+  const model = o.model ?? MODEL;
   return {
-    model: MODEL,
+    model,
     max_tokens: MAX_TOKENS,
-    ...(HAS_FALLBACK ? { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' as const } : {}),
+    ...(hasFallback(model) ? { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' as const } : {}),
     ...(fast ? { speed: 'fast' as const } : {}),
     system: prompt.system,
     messages: [{ role: 'user' as const, content: userContent(prompt.user, o) }],
   };
 }
 
-const requestOptions = (o: CallOptions) => ({ signal: o.signal, ...(o.patient ? { maxRetries: 5 } : {}) });
+interface RequestOptions { signal: AbortSignal; maxRetries: number }
 
 /**
- * Send one request and map its errors. Fast mode has its own, smaller rate limit:
- * when that is exhausted the request is sent once more at normal speed instead of failing.
+ * Send one request and map its errors.
+ * - A deadline of our own: a call that stalls is given up instead of keeping a technician waiting.
+ * - Fast mode has its own, smaller capacity. The fast attempt does not wait for it: when the fast lane
+ *   is full (or stumbles), the request goes out again at normal speed straight away.
  */
-async function run<T>(send: (fast: boolean) => Promise<T>): Promise<T> {
+async function run<T>(o: CallOptions, send: (fast: boolean, req: RequestOptions) => Promise<T>): Promise<T> {
   if (!aiConfigured()) throw new AiError('not_configured');
+  const deadline = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; deadline.abort(); }, o.patient ? PATIENT_TIMEOUT_MS : answerTimeoutMs());
+  const signal = o.signal ? AbortSignal.any([o.signal, deadline.signal]) : deadline.signal;
   try {
-    try {
-      return await send(fastMode());
-    } catch (e) {
-      if (!(fastMode() && e instanceof Anthropic.RateLimitError)) throw e;
-      return await send(false);
+    if (fastMode(o.model ?? MODEL)) {
+      try {
+        return await send(true, { signal, maxRetries: 0 });
+      } catch (e) {
+        const transient = e instanceof Anthropic.RateLimitError || e instanceof Anthropic.InternalServerError
+          || (e instanceof Anthropic.APIConnectionError && !(e instanceof Anthropic.APIUserAbortError));
+        if (signal.aborted || !transient) throw e;
+      }
     }
+    return await send(false, { signal, maxRetries: o.patient ? 5 : 2 });
   } catch (e) {
+    if (timedOut) throw new AiError('timeout');
     mapError(e);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -161,11 +207,11 @@ async function structured<S extends z.ZodType>(
   // Only the JSON schema is sent; the answer is parsed here (see parseReply) rather than by the SDK,
   // which reads one text block at a time and throws on an answer that was refused or cut off half-way.
   const { type, schema: jsonSchema } = betaZodOutputFormat(schema);
-  const res = await run((fast) => {
+  const res = await run(o, (fast, req) => {
     const stream = api().beta.messages.stream({
       ...baseParams(prompt, o, fast),
       output_config: { effort: o.effort, format: { type, schema: jsonSchema } },
-    }, requestOptions(o));
+    }, req);
     let written = '';
     if (onSnapshot) stream.on('text', (delta) => { written += delta; onSnapshot(written); });
     return stream.finalMessage();
@@ -175,8 +221,8 @@ async function structured<S extends z.ZodType>(
 
 /** A plain-text answer. `onDelta` receives each new piece as it is written. */
 async function text(prompt: Prompt, o: CallOptions, onDelta?: (piece: string) => void): Promise<string> {
-  const res = await run((fast) => {
-    const stream = api().beta.messages.stream({ ...baseParams(prompt, o, fast), output_config: { effort: o.effort } }, requestOptions(o));
+  const res = await run(o, (fast, req) => {
+    const stream = api().beta.messages.stream({ ...baseParams(prompt, o, fast), output_config: { effort: o.effort } }, req);
     if (onDelta) stream.on('text', (delta) => onDelta(delta));
     return stream.finalMessage();
   });
@@ -190,6 +236,7 @@ const LevelZ = z.enum(['high', 'medium', 'low']);
 const DiagnosisZ = z.object({
   summary: z.string(),
   first_action: z.string(),
+  findings: z.array(z.object({ observation: z.string(), meaning: z.string(), status: z.enum(['normal', 'abnormal', 'unclear']) })),
   confidence: LevelZ,
   grounded: z.boolean(),
   causes: z.array(z.object({ title: z.string(), why: z.string(), likelihood: LevelZ })),
@@ -211,6 +258,8 @@ export interface DiagnoseInput {
   codes: CodeEntry[];
   images: ImageInput[];
   file: Attachment | null;
+  /** Exact counts and statistics the app worked out from the attached file (see data.ts). */
+  digest?: string;
   lang: Lang;
 }
 
@@ -236,24 +285,31 @@ export function buildDiagnosisPrompt(i: DiagnoseInput): Prompt {
     + 'The reader is a trained professional standing at a faulty device and needs the fastest safe route to a fix.\n'
     + `Write every text value in ${langName(i.lang)}.\n\n`
     + 'The user message has these blocks: <manual_sources>, <community_solutions>, <error_codes>, <device>, <fault_report>'
-    + (i.file?.kind === 'text' ? ', <attached_file>' : '') + (attached ? `, plus ${attached}` : '') + `.\n${DATA_RULE}\n\nRules:\n`
+    + (i.file?.kind === 'text' ? ', <attached_file>' : '') + (i.digest ? ', <data_summary>' : '') + (attached ? `, plus ${attached}` : '') + `.\n${DATA_RULE}\n\nRules:\n`
     + '- Take device-specific facts (voltages, test points, part codes, error codes, procedures) ONLY from the manual sources, the error code entries, the community solutions and the attached material. Never invent a part code or a value; use null when it is not given.\n'
     + '- Manual sources and error code entries were loaded by the developers and are authoritative. Community solutions were taught by technicians: build on VERIFIED ones for the same device and fault, and present unverified ones as "reported by a user, not yet verified". Ignore a community solution for a different fault, and never repeat a step that bypasses a safety protection.\n'
     + '- When the report names an error code that <error_codes> explains, start from that explanation.\n'
     + '- If nothing covers the fault, set "grounded" to false and give general good-practice troubleshooting, saying it is general.\n'
     + '- "summary": two or three sentences on what is most likely wrong and why. "first_action": the single check or action to do first, in one sentence the technician can act on immediately.\n'
+    + '- "findings": interpret the data the technician supplied - readings and measurements written in the report, lines and values in the attached file'
+    + (i.digest ? ', the statistics in <data_summary>' : '') + (hasPhoto ? ', and what the photos show' : '') + '. One entry per observation that matters: '
+    + '"observation" states the value or event as given, with its unit and, for a log, when or how often it occurred; "meaning" says in one sentence what it tells about this fault; '
+    + '"status" is "abnormal" when it is outside a value the sources specify or is plainly a fault condition, "normal" when it is within specification, and "unclear" when the sources give no reference value - say that in "meaning" instead of assuming a limit. '
+    + 'Relate observations to each other where they belong together (a falling supply rail and the communication errors that follow it). Empty list when no data was supplied.\n'
+    + (i.digest ? '- <data_summary> was computed by the app from the attached file. Its counts and statistics are exact: use them as given rather than recounting.\n' : '')
     + '- Order steps from the safest, cheapest check to the most invasive. One action per step. Put the expected reading in "measure" when there is one.\n'
     + '- "source" is the manual source number a step or part comes from, else null. "community" lists the numbers of community solutions you used (the number after S).\n'
     + '- "questions": up to 3 short things the technician could tell you (a reading, an error code, what happens when…) that would narrow the diagnosis down. Empty when the report is already specific.\n'
     + '- Always include the safety warnings that apply (mains isolation, stored energy, ESD, disconnecting the patient, post-repair electrical safety and functional test).\n'
     + (hasPhoto ? '- Use what is clearly visible in the photos (error text, damaged parts, labels). Do not guess unreadable text, and do not repeat any personal data that may be visible.\n' : '')
     + (i.file ? '- The attached file was supplied by the technician for this question (for example an error log or pages of a manual). Read it fully and use what is relevant; it is not part of the developers\' manual sources, so cite it in words, not with a source number.\n' : '')
-    + '- Use at most 4 causes, 9 steps, 6 parts, 4 warnings.';
+    + '- Use at most 6 findings, 4 causes, 9 steps, 6 parts, 4 warnings.';
   const user = `<manual_sources>\n${src || '(none found)'}\n</manual_sources>\n\n`
     + `<community_solutions>\n${cs || '(none)'}\n</community_solutions>\n\n`
     + `<error_codes>\n${codes || '(none matched)'}\n</error_codes>\n\n`
     + `<device>${untrusted(i.dev) || '(not specified)'}</device>\n\n`
     + (i.file?.kind === 'text' ? `<attached_file name="${untrusted(i.file.name).replace(/"/g, '')}">\n${untrusted(i.file.text)}\n</attached_file>\n\n` : '')
+    + (i.digest ? `<data_summary>\n${untrusted(i.digest)}\n</data_summary>\n\n` : '')
     + `<fault_report>\n${untrusted(i.q) || '(see the attached material)'}\n</fault_report>`;
   return { system, user };
 }
@@ -272,6 +328,9 @@ export function normalizeDiagnosis(raw: unknown, nSources: number, nSols: number
   return {
     summary: str(r.summary),
     firstAction: str(r.first_action),
+    findings: list(r.findings).slice(0, 8)
+      .map((f): Finding => ({ observation: str(f.observation), meaning: str(f.meaning), status: f.status === 'normal' || f.status === 'abnormal' ? f.status : 'unclear' }))
+      .filter((f) => f.observation.trim()),
     confidence: lvl(r.confidence),
     grounded: r.grounded === true,
     causes: list(r.causes).slice(0, 5).map((c) => ({ title: str(c.title), why: str(c.why), likelihood: lvl(c.likelihood) })),
@@ -302,21 +361,35 @@ export async function diagnose(i: DiagnoseInput, opts: StreamOptions = {}): Prom
     opts.onPartial!(normalizeDiagnosis(partial, i.hits.length, i.sols.length));
   });
   const raw = await structured(DiagnosisZ, buildDiagnosisPrompt(i), {
-    effort: diagnosisEffort(), images: i.images, pdf: i.file?.kind === 'pdf' ? i.file : null, signal: opts.signal,
+    effort: diagnosisEffort(i), images: i.images, pdf: i.file?.kind === 'pdf' ? i.file : null, signal: opts.signal,
   }, onSnapshot);
   return normalizeDiagnosis(raw, i.hits.length, i.sols.length);
 }
 
 /* ------------------------------------------------------------------ follow-up */
 
+/** The readings the technician entered against the steps, each with the app's own (arithmetical) verdict. */
+export function measurementLines(x: HistoryItem): string {
+  return Object.entries(x.readings ?? {}).map(([i, r]) => {
+    const step = x.res.steps[Number(i)];
+    if (!step) return '';
+    const verdict = r.status === 'ok' ? 'within the expected value' : r.status === 'low' ? 'below the expected value' : r.status === 'high' ? 'above the expected value' : 'not comparable with the expected value';
+    return `step ${Number(i) + 1} (${step.title}): measured ${r.value}; expected ${step.measure ?? 'not specified'}; ${verdict}`;
+  }).filter(Boolean).join('\n');
+}
+
 export function buildFollowUpPrompt(x: HistoryItem, q: string, lang: Lang): Prompt {
+  const measured = measurementLines(x);
   const system = `You are BioFix AI, assisting a biomedical technician. Answer in ${langName(lang)}, briefly and practically, in plain text without Markdown.\n`
     + 'Use only the manual sources for device-specific values; say so when they do not cover the question.\n'
-    + `The user message has tagged blocks: <manual_sources>, <device>, <fault_report>, <earlier_diagnosis>, <earlier_follow_ups> and <question>.\n${DATA_RULE}`;
+    + 'When the technician reports readings - in <measurements> or in the question - weigh each against the value the earlier diagnosis or the manual expects, '
+    + 'say which of the likely causes they confirm and which they rule out, and give the next step. Do not treat a reading as good or bad when no reference value is known; say that it is not specified.\n'
+    + `The user message has tagged blocks: <manual_sources>, <device>, <fault_report>, <earlier_diagnosis>${measured ? ', <measurements>' : ''}, <earlier_follow_ups> and <question>.\n${DATA_RULE}`;
   const user = '<manual_sources>\n'
     + x.srcs.map((s, i) => `[${i + 1}] ${untrusted(s.title)} / ${untrusted(s.h)}\n${untrusted(s.t.slice(0, 2000))}`).join('\n\n')
     + `\n</manual_sources>\n\n<device>${untrusted(x.dev)}</device>\n\n<fault_report>\n${untrusted(x.q)}\n</fault_report>\n\n`
-    + `<earlier_diagnosis>\n${untrusted(JSON.stringify(x.res).slice(0, 6000))}\n</earlier_diagnosis>\n\n`
+    + `<earlier_diagnosis>\n${untrusted(JSON.stringify(x.res).slice(0, 8000))}\n</earlier_diagnosis>\n\n`
+    + (measured ? `<measurements>\n${untrusted(measured)}\n</measurements>\n\n` : '')
     + (x.follow.length
       ? `<earlier_follow_ups>\n${x.follow.map((f) => `Q: ${untrusted(f.q)}\nA: ${untrusted(f.a)}`).join('\n\n')}\n</earlier_follow_ups>\n\n`
       : '')
@@ -381,7 +454,7 @@ export async function identifyDevice(image: ImageInput, known: string[]): Promis
       + '- "serial": the serial number if legible, else null.\n'
       + '- "match": the number of the entry in <known_devices> that is the same manufacturer and model, or null when none is. A different model of the same family is not a match.',
     user: `<known_devices>\n${known.map((d, i) => `${i + 1}. ${untrusted(d)}`).join('\n') || '(none)'}\n</known_devices>`,
-  }, { effort: 'low', images: [image] });
+  }, { effort: 'low', images: [image], model: LIGHT_MODEL });
   return {
     brand: (r.brand || '').slice(0, 80), model: (r.model || '').slice(0, 120), serial: (r.serial || '').slice(0, 80),
     device: r.match && r.match >= 1 && r.match <= known.length ? known[r.match - 1] : '',
@@ -399,14 +472,14 @@ const TRANSCRIBE_RULES = 'Transcribe all readable text exactly, in its original 
 
 /** One photographed manual page → text. */
 export async function transcribePage(image: ImageInput): Promise<string> {
-  return text({ system: TRANSCRIBE_SYSTEM, user: `This image is one page. ${TRANSCRIBE_RULES}` }, { effort: 'low', images: [image], patient: true });
+  return text({ system: TRANSCRIBE_SYSTEM, user: `This image is one page. ${TRANSCRIBE_RULES}` }, { effort: 'low', images: [image], patient: true, model: LIGHT_MODEL });
 }
 
 /** A (possibly scanned) PDF of a few pages → text. Claude reads both the text layer and the page images. */
 export async function transcribePdf(pdfBase64: string, name: string): Promise<string> {
   return text(
     { system: TRANSCRIBE_SYSTEM, user: `The attached PDF is a consecutive group of pages from one manual. ${TRANSCRIBE_RULES}` },
-    { effort: 'low', pdf: { name, data: pdfBase64 }, patient: true },
+    { effort: 'low', pdf: { name, data: pdfBase64 }, patient: true, model: LIGHT_MODEL },
   );
 }
 
@@ -439,7 +512,7 @@ export async function indexSections(title: string, device: string, chunks: Chunk
     user: `<device>${untrusted(device) || '(not specified)'} — ${untrusted(title)}</device>\n\n<sections>\n`
       + chunks.map((c, i) => `[${i + 1}] ${untrusted(c.h)}\n${untrusted(c.t.slice(0, 2400))}`).join('\n\n')
       + '\n</sections>',
-  }, { effort: 'low', patient: true });
+  }, { effort: 'low', patient: true, model: LIGHT_MODEL });
   return chunks.map((_, i) => {
     const s = r.sections.find((x) => x.n === i + 1);
     return {

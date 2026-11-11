@@ -1,3 +1,5 @@
+import type { DataDigest, Reading } from './data.js';
+
 export type Lang = 'tr' | 'en';
 export type PlanId = 'free' | 'pro' | 'trainer' | 'biz' | 'org';
 export type SolStatus = 'ver' | 'pen' | 'rej';
@@ -68,6 +70,8 @@ export interface Diagnosis {
   summary: string;
   /** The single thing to check or do first. */
   firstAction: string;
+  /** What the supplied data (readings, log lines, photos) shows, each with its interpretation. Absent in older records. */
+  findings?: Finding[];
   confidence: Level;
   grounded: boolean;
   causes: { title: string; why: string; likelihood: Level }[];
@@ -79,6 +83,8 @@ export interface Diagnosis {
   community: number[];
 }
 
+export interface Finding { observation: string; meaning: string; status: 'normal' | 'abnormal' | 'unclear' }
+
 export interface HistoryItem {
   id: string; q: string; dev: string; date: string; res: Diagnosis;
   done: Record<string, boolean>; follow: { q: string; a: string }[];
@@ -87,6 +93,12 @@ export interface HistoryItem {
   codes?: { code: string; text: string; device: string; title: string }[];
   /** What was attached (the files themselves are not kept). */
   attached?: { photos: number; file: string };
+  /** Counts and statistics worked out from an attached log or table. */
+  data?: DataDigest;
+  /** The answer was reused from an identical earlier question instead of being generated again. */
+  stored?: boolean;
+  /** Values the technician measured, keyed by step number, each judged against the step's expected value. */
+  readings?: Record<string, Reading>;
 }
 
 export interface LedgerEntry { n: number; why: string; date: string }

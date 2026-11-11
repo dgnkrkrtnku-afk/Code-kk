@@ -196,15 +196,21 @@ test('a half-written or malformed model answer is turned into a safe, complete s
   const d = normalizeDiagnosis({
     summary: 'Güç', causes: [{ title: 'Q3' }, 'junk', null], steps: [{ title: 'Ölç', source: 99, measure: '' }],
     parts: [{ name: 'C14', action: 'explode', source: 1 }], warnings: ['ESD', 5], questions: ['Kod?', '', 'a', 'b', 'c'], community: [1, 7, 'x'],
+    findings: [{ observation: '5V hattı 4,6 V', meaning: 'Tolerans altı', status: 'abnormal' }, { observation: 'Fan 1180 rpm', status: 'weird' }, { meaning: 'no observation' }, 'junk'],
   }, 2, 3);
   assert.deepEqual(d, {
     summary: 'Güç', firstAction: '', confidence: 'medium', grounded: false,
+    findings: [
+      { observation: '5V hattı 4,6 V', meaning: 'Tolerans altı', status: 'abnormal' },
+      { observation: 'Fan 1180 rpm', meaning: '', status: 'unclear' },
+    ],
     causes: [{ title: 'Q3', why: '', likelihood: 'medium' }],
     steps: [{ title: 'Ölç', detail: '', measure: null, source: null }],
     parts: [{ name: 'C14', action: 'check', code: null, note: '', source: 1 }],
     warnings: ['ESD'], questions: ['Kod?', 'a', 'b'], community: [1],
   });
   assert.equal(normalizeDiagnosis(undefined, 0, 0).summary, '');
+  assert.deepEqual(normalizeDiagnosis({ summary: 'x' }, 0, 0).findings, []);
 });
 
 /* ------------------------------------------------------------------ device label */
@@ -478,4 +484,162 @@ test('with a device selected only its own manual and solutions are used; an unkn
   assert.ok(new Set(any.json.quick.docs.map((d: any) => d.title)).size > 1, 'sections from more than one manual');
   const mine = await app.call('POST', '/diagnose', { q: 'batarya kapasite testi', dev: PM12 }, t);
   assert.deepEqual([...new Set(mine.json.quick.docs.map((d: any) => d.title))], ['Hasta monitörü güç kartı arıza giderme']);
+});
+
+/* ------------------------------------------------------------------ speed: stored answers, instant search */
+
+test('the same plain-text fault asked again is answered at once from the stored answer, until the knowledge changes', async () => {
+  const { service, seen } = fakeAi();
+  const app = await makeApp(service);
+  const a = await app.register('first@example.com');
+  const b = await app.register('second@example.com');
+  const ask = (t: string, body: Record<string, unknown>, extra: Record<string, string> = {}) => app.call('POST', '/diagnose', body, t, extra);
+
+  const first = await ask(a, { q: 'Şarj süresi uzadı', dev: 'Örnek Defibrilatör DF-200' });
+  assert.equal(first.json.item.stored, undefined);
+  assert.equal(seen.calls, 1);
+
+  // The same person again, and somebody else typing it without Turkish letters and in capitals.
+  const again = await ask(a, { q: 'Şarj süresi uzadı', dev: 'Örnek Defibrilatör DF-200' });
+  const other = await ask(b, { q: '  SARJ SURESI   UZADI ', dev: 'ornek defibrilator df-200' });
+  assert.deepEqual([again.json.item.stored, other.json.item.stored], [true, true]);
+  assert.equal(other.json.item.res.summary, first.json.item.res.summary);
+  assert.notEqual(other.json.item.id, first.json.item.id, 'each person gets a record of their own');
+  assert.equal(seen.calls, 1, 'no further AI call');
+  assert.equal((await app.call('GET', '/me', undefined, a)).json.user.usedToday, 1, 'a stored answer does not use up the allowance');
+  assert.equal((await app.call('GET', '/me', undefined, b)).json.user.usedToday, 0);
+
+  // Not shared across devices or languages; "generate again" skips the stored answer.
+  await ask(b, { q: 'Şarj süresi uzadı', dev: '' });
+  await ask(b, { q: 'Şarj süresi uzadı', dev: 'Örnek Defibrilatör DF-200' }, { 'x-lang': 'en' });
+  const fresh = await ask(b, { q: 'Şarj süresi uzadı', dev: 'Örnek Defibrilatör DF-200', fresh: true });
+  assert.equal(fresh.json.item.stored, undefined);
+  assert.equal(seen.calls, 4);
+
+  // A stored answer goes out as a stream too: instant results, then the record.
+  const streamed = await app.stream('/diagnose', { q: 'Şarj süresi uzadı', dev: 'Örnek Defibrilatör DF-200' }, a);
+  assert.deepEqual(streamed.events.map((e) => e.type), ['quick', 'done']);
+  assert.equal(streamed.events[1].item.stored, true);
+
+  // New knowledge (a solution is taught, a vote changes what is verified) outdates stored answers.
+  await app.call('POST', '/solutions', { brand: 'Örnek', model: 'Defibrilatör DF-200', symptom: 'Şarj süresi 15 saniyeyi geçiyor', steps: '1. Bataryayı test et\n2. Kapasite düşükse değiştir' }, b);
+  const after = await ask(a, { q: 'Şarj süresi uzadı', dev: 'Örnek Defibrilatör DF-200' });
+  assert.equal(after.json.item.stored, undefined);
+  assert.equal(seen.calls, 5);
+});
+
+test('questions with a photo or a file are never answered from a stored answer', async () => {
+  const { service, seen } = fakeAi();
+  const app = await makeApp(service);
+  const t = await proUser(app, 'attach@example.com');
+  const body = { q: 'Ekranda çizgiler var', dev: PM12, images: [{ data: JPEG, mediaType: 'image/jpeg' }] };
+  await app.call('POST', '/diagnose', body, t);
+  const second = await app.call('POST', '/diagnose', body, t);
+  assert.equal(second.json.item.stored, undefined);
+  assert.equal(seen.calls, 2);
+  // ...and the text-only version of the same question is a different question.
+  await app.call('POST', '/diagnose', { q: 'Ekranda çizgiler var', dev: PM12 }, t);
+  assert.equal(seen.calls, 3);
+});
+
+test('the instant results can be fetched on their own, without AI and without using the allowance', async () => {
+  const { service, seen } = fakeAi();
+  const app = await makeApp(service);
+  const t = await app.register('search@example.com');
+  const r = await app.call('POST', '/search', { q: 'cihaz e-21 veriyor', dev: PM12 }, t);
+  assert.equal(r.status, 200);
+  assert.equal(r.json.quick.codes[0].code, 'E21');
+  assert.ok(r.json.quick.docs.length > 0);
+  assert.equal(seen.calls, 0);
+  assert.equal((await app.call('GET', '/me', undefined, t)).json.user.usedToday, 0);
+  assert.equal((await app.call('POST', '/search', { q: 'x' })).status, 401);
+});
+
+/* ------------------------------------------------------------------ interpreting data */
+
+const LOG = `2026-11-10 08:14:02 INFO  PSU 5V rail 4.61V
+2026-11-10 08:14:03 ERROR COMM timeout board=PSU
+2026-11-10 08:14:03 ERROR E21
+2026-11-10 08:20:11 INFO  PSU 5V rail 4.60V
+2026-11-10 08:20:12 ERROR E21
+2026-11-10 08:45:09 INFO  PSU 5V rail 4.52V
+2026-11-10 08:45:10 ERROR E24
+`;
+
+test('an attached log is read at once: its codes are explained from the manual and its statistics go to the AI', async () => {
+  const { service, seen } = fakeAi();
+  const app = await makeApp(service);
+  const t = await proUser(app, 'log@example.com');
+  const file = { name: 'servis.log', mediaType: 'text/plain', data: Buffer.from(LOG).toString('base64') };
+  // Nothing typed about a code: the codes come from the file alone.
+  const r = await app.stream('/diagnose', { q: 'Cihaz arada bir kapanıyor', dev: PM12, file }, t);
+  const quick = r.events[0].quick;
+  assert.deepEqual(quick.data.codes.map((c: any) => [c.code, c.count]), [['E21', 2], ['E24', 1]]);
+  assert.deepEqual([quick.data.kind, quick.data.errors, quick.data.from, quick.data.to], ['log', 4, '2026-11-10 08:14:02', '2026-11-10 08:45:10']);
+  assert.deepEqual(quick.data.series.map((s: any) => [s.name, s.unit, s.min, s.max, s.trend]), [['PSU 5V rail', 'V', 4.52, 4.61, 'down']]);
+  assert.deepEqual(quick.codes.map((c: any) => c.code), ['E21', 'E24'], 'the manual\'s meaning of each code found in the log');
+  assert.match(quick.codes[0].text, /Güç kartı haberleşme hatası/);
+
+  const sent = seen.inputs[seen.inputs.length - 1];
+  assert.match(sent.digest ?? '', /codes: E21 ×2 .*; E24 ×1/);
+  assert.match(sent.digest ?? '', /reading "PSU 5V rail" \[V\]: n=3 min=4.52 max=4.61/);
+  assert.deepEqual(sent.codes.map((c) => c.code), ['E21', 'E24']);
+  const prompt = buildDiagnosisPrompt(sent);
+  assert.match(prompt.user, /<data_summary>\nlog, 7 lines, from 2026-11-10 08:14:02 to 2026-11-10 08:45:10/);
+  assert.match(prompt.system, /"findings": interpret the data/);
+  assert.match(prompt.system, /<data_summary> was computed by the app/);
+
+  // The digest is kept with the record (the file is not), so the summary is there when the record is reopened.
+  const item = r.events[r.events.length - 1].item;
+  assert.equal(item.data.codes[0].code, 'E21');
+  assert.equal(JSON.stringify(app.store.db).includes('COMM timeout'), false, 'the file itself is not stored');
+
+  // Without AI on the server the summary and the code meanings are still the answer.
+  const off = await makeApp();
+  const t2 = await off.register('log2@example.com');
+  const noAi = await off.call('POST', '/diagnose', { q: '', dev: PM12, file }, t2);
+  assert.equal(noAi.json.item, null);
+  assert.deepEqual(noAi.json.quick.codes.map((c: any) => c.code), ['E21', 'E24']);
+  assert.equal(noAi.json.quick.data.series[0].last, 4.52);
+});
+
+test('a value measured at a step is judged against the expected value and reaches the follow-up', async () => {
+  const withSteps = {
+    ...(await import('./helpers.js')).diagnosis,
+    steps: [
+      { title: 'TP2 noktasında 5 V ölç', detail: '', measure: '5,0 V ± 0,25 V', source: 1 },
+      { title: 'J5 kablosunu oturt', detail: '', measure: null, source: null },
+    ],
+  };
+  const { service, seen } = fakeAi();
+  const app = await makeApp({ ...service, diagnose: async () => withSteps });
+  const t = await app.register('read@example.com');
+  const made = await app.call('POST', '/diagnose', { q: 'E21 veriyor', dev: PM12 }, t);
+  const id = made.json.item.id;
+  const put = (i: number, value: string, token = t) => app.call('POST', `/history/${id}/readings`, { i, value }, token);
+
+  const low = await put(0, '4,6 V');
+  assert.deepEqual(low.json.reading, { value: '4,6 V', status: 'low', deviation: -8 });
+  assert.deepEqual((await put(0, '5.1')).json.reading, { value: '5.1', status: 'ok', deviation: 2 }, 'a new value replaces the old one');
+  assert.equal((await put(1, 'oturdu')).json.reading.status, 'unknown', 'a step without an expected value gets no verdict');
+  assert.equal((await put(7, '5 V')).status, 404, 'no such step');
+  assert.equal((await put(0, 'x'.repeat(61))).json.error, 'invalid_input');
+  const other = await app.register('read2@example.com');
+  assert.equal((await put(0, '5 V', other)).status, 404, 'only the owner\'s record');
+
+  // Readings are kept with the record and handed to the AI with every follow-up question.
+  await put(0, '4,6 V');
+  const history = (await app.call('GET', '/history', undefined, t)).json.items[0];
+  assert.deepEqual(history.readings['0'], { value: '4,6 V', status: 'low', deviation: -8 });
+  const { buildFollowUpPrompt } = await import('../src/ai.js');
+  const stored = app.store.db.users[Object.keys(app.store.db.users)[0]].history[0];
+  const prompt = buildFollowUpPrompt(stored, 'Sırada ne yapmalıyım?', 'tr');
+  assert.match(prompt.user, /<measurements>\nstep 1 \(TP2 noktasında 5 V ölç\): measured 4,6 V; expected 5,0 V ± 0,25 V; below the expected value\nstep 2 \(J5 kablosunu oturt\): measured oturdu; expected not specified; not comparable/);
+  assert.match(prompt.system, /weigh each against the value/);
+  await app.call('POST', `/history/${id}/follow-up`, { q: 'Sırada ne yapmalıyım?' }, t);
+  assert.deepEqual(seen.followUps, ['Sırada ne yapmalıyım?']);
+
+  // An empty value removes the reading.
+  assert.equal((await put(0, '')).json.reading, null);
+  assert.equal((await app.call('GET', '/history', undefined, t)).json.items[0].readings['0'], undefined);
 });

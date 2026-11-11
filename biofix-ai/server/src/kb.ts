@@ -209,6 +209,27 @@ for (const group of GLOSSARY) {
 
 export const devOf = (d: { brand: string; model: string }) => `${d.brand} ${d.model}`.trim();
 
+/** Device names are compared for every search result; their tokens are worked out once per name. */
+const nameCache = new Map<string, string[]>();
+function nameToks(name: string): string[] {
+  let t = nameCache.get(name);
+  if (!t) {
+    if (nameCache.size > 5000) nameCache.clear();
+    t = toks(name);
+    nameCache.set(name, t);
+  }
+  return t;
+}
+/** `sameDevice(x, dev)` for many x: each distinct name is compared once. */
+function deviceMatcher(dev: string): (name: string) => boolean {
+  const seen = new Map<string, boolean>();
+  return (name) => {
+    let v = seen.get(name);
+    if (v === undefined) { v = sameDevice(name, dev); seen.set(name, v); }
+    return v;
+  };
+}
+
 /**
  * Do two device names mean the same device? Same words in any spelling ("Örnek Hasta Monitörü PM-12" vs
  * "ornek hasta monitoru pm12"), or one name contained in the other when it carries a model number
@@ -216,7 +237,7 @@ export const devOf = (d: { brand: string; model: string }) => `${d.brand} ${d.mo
  */
 export function sameDevice(a: string, b: string): boolean {
   if (!a || !b) return false;
-  const [short, long] = [toks(a), toks(b)].sort((x, y) => x.length - y.length);
+  const [short, long] = [nameToks(a), nameToks(b)].sort((x, y) => x.length - y.length);
   if (!short.length) return false;
   const set = new Set(long);
   if (!short.every((w) => set.has(w))) return false;
@@ -286,6 +307,8 @@ export type SolHit = { type: 'sol'; sol: Solution };
 type Entry = (DocHit | SolHit) & { tf: Map<string, number>; len: number; dev: string };
 
 const IS_CODE = /^[a-z]{1,4}\d{1,4}[a-z]?$/;
+/** Results scoring below this share of the best result are dropped. */
+const RELEVANCE_FLOOR = 0.2;
 
 export class KnowledgeIndex {
   private entries: Entry[] = [];
@@ -320,14 +343,26 @@ export class KnowledgeIndex {
 
   /** Manual entries for the error codes mentioned in a fault report; the selected device's entries first. */
   lookupCodes(query: string, devKey: string, limit = 5): CodeEntry[] {
-    const found = codesInQuery(query).flatMap((c) => this.codes.get(c) ?? []);
+    return this.codesNamed(codesInQuery(query), devKey, limit);
+  }
+
+  /** Manual entries for the given (normalised) codes. */
+  codesNamed(codes: string[], devKey: string, limit = 5): CodeEntry[] {
+    const found = codes.flatMap((c) => this.codes.get(c) ?? []);
     // With a device selected, another device's "E21" would be a wrong answer: only that device's codes count.
-    return (devKey ? found.filter((e) => sameDevice(e.device, devKey)) : found).slice(0, limit);
+    const same = deviceMatcher(devKey);
+    return (devKey ? found.filter((e) => same(e.device)) : found).slice(0, limit);
+  }
+
+  /** Whether any manual defines this (normalised) code, for the given device when one is selected. */
+  knowsCode(code: string, devKey: string): boolean {
+    return this.codesNamed([code], devKey, 1).length > 0;
   }
 
   /** Every code a device's manuals define (for the quick list under the device selector). */
   codesOf(devKey: string, limit = 40): CodeEntry[] {
-    return [...this.codes.values()].flat().filter((e) => sameDevice(e.device, devKey)).slice(0, limit);
+    const same = deviceMatcher(devKey);
+    return [...this.codes.values()].flat().filter((e) => same(e.device)).slice(0, limit);
   }
 
   private rank(query: string, devKey: string, type?: 'doc' | 'sol'): { e: Entry; s: number }[] {
@@ -340,7 +375,8 @@ export class KnowledgeIndex {
       terms.set(w, Math.max(terms.get(w) ?? 0, IS_CODE.test(w) ? 2.5 : 1));
       SYNONYMS.get(w)?.forEach((x) => { if (!terms.has(x)) terms.set(x, 0.55); });
     }
-    const deviceHasDocs = !!devKey && this.devicesWithDocs.some((d) => sameDevice(d, devKey));
+    const same = deviceMatcher(devKey);
+    const deviceHasDocs = !!devKey && this.devicesWithDocs.some(same);
     const res: { e: Entry; s: number }[] = [];
     for (const e of this.entries) {
       if (type && e.type !== type) continue;
@@ -354,14 +390,17 @@ export class KnowledgeIndex {
       }
       if (s <= 0) continue;
       if (devKey) {
-        if (sameDevice(e.dev, devKey)) s *= 2.2;
+        if (same(e.dev)) s *= 2.2;
         // When we hold this device's own manual, another device's procedure is more likely to mislead than help.
         else if (e.dev && (e.type === 'sol' || deviceHasDocs)) s *= 0.5;
       }
       if (e.type === 'sol' && solStatus(e.sol) === 'ver') s *= 1.6;
       res.push({ e, s });
     }
-    return res.sort((a, b) => b.s - a.s);
+    res.sort((a, b) => b.s - a.s);
+    // A section that shares one common word with the report is noise next to one that matches it well.
+    const floor = res.length ? res[0].s * RELEVANCE_FLOOR : 0;
+    return res.filter((x) => x.s >= floor);
   }
 
   search(query: string, devKey: string, k: number, type: 'doc'): DocHit[];

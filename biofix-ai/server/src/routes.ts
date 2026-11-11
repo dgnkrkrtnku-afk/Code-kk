@@ -11,8 +11,9 @@ import {
 } from './auth.js';
 import { Billing, PLAY_BASE_PLANS, PLAY_SUBSCRIPTIONS, POINT_PACKS, type PlayNotification } from './billing.js';
 import { adminToken, demoPayments, rtdnSecret } from './config.js';
+import { analyzeData, digestText, judgeReading, type DataDigest } from './data.js';
 import { bad, forbidden, HttpError, notFound } from './errors.js';
-import { chunkText, devOf, NEED_OK, prefixMatchCount, sameDevice, solStatus, splitLessons } from './kb.js';
+import { chunkText, devOf, fold, NEED_OK, prefixMatchCount, sameDevice, solStatus, splitLessons, type CodeEntry, type DocHit, type SolHit } from './kb.js';
 import type { Mailer } from './mailer.js';
 import { isPlan, PLANS, planForClient, planPrice, PT, PT_PER_USD, ptsFor } from './plans.js';
 import type { PlayClient } from './play.js';
@@ -111,7 +112,9 @@ function ndjson(res: Response) {
   res.status(200);
   res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
   res.setHeader('X-Accel-Buffering', 'no'); // nginx: pass each line through instead of buffering
+  res.setHeader('Cache-Control', 'no-store, no-transform'); // proxies must not hold the stream back to compress it
   res.flushHeaders();
+  res.socket?.setNoDelay(true); // each line leaves at once instead of waiting to fill a packet
   // Keeps mobile networks and proxies from closing the connection while the model is thinking.
   const ping = setInterval(() => { if (!res.writableEnded && !res.destroyed) res.write('{"type":"ping"}\n'); }, 15_000);
   return {
@@ -190,7 +193,8 @@ export function createRouter(store: Store, deps: Deps) {
 
   const solView = (s: Solution, c: Ctx) => ({
     id: s.id, by: s.by, brand: s.brand, model: s.model, symptom: s.symptom, code: s.code, steps: s.steps, part: s.part,
-    photo: s.photo, photoNote: s.photoNote, ok: s.ok, fail: s.fail, ai: s.ai, date: s.date,
+    // Photos are hundreds of kilobytes each: lists say only that there is one, and the card fetches it when opened.
+    photo: '', hasPhoto: !!s.photo, photoNote: s.photoNote, ok: s.ok, fail: s.fail, ai: s.ai, date: s.date,
     status: solStatus(s), mine: s.userId === c.user.id, myVote: s.votes[c.user.id] ?? null,
     canDelete: s.userId === c.user.id || c.isAdmin, checking: pendingChecks.has(s.id),
     // Flagged as a safety risk by the AI pre-check: stays unverified until a developer clears it.
@@ -598,6 +602,54 @@ export function createRouter(store: Store, deps: Deps) {
     res.json({ ...found, label: `${found.brand} ${found.model}`.trim() });
   }));
 
+  /**
+   * Step 1 of every answer - instant, no AI: what the manuals and other technicians already say about
+   * the fault, and what an attached log or table contains.
+   */
+  function instant(q: string, dev: string, c: Ctx, file: ai.Attachment | null = null) {
+    const qq = `${q} ${dev}`;
+    const hits: DocHit[] = forDevice(store.index.search(qq, dev, 24, 'doc'), dev, (e) => devOf(e.doc), 8);
+    // Never suggest a fix that failed for others or that the AI pre-check flagged as dangerous.
+    const sols: SolHit[] = forDevice(
+      store.index.search(qq, dev, 24, 'sol').filter((e) => solStatus(e.sol) !== 'rej' && !e.sol.ai?.safe),
+      dev, (e) => devOf(e.sol), 4,
+    );
+    // An attached log or table is read here and now: its error codes are looked up like typed ones.
+    const data: DataDigest | null = file?.kind === 'text' ? analyzeData(file.text, (code) => store.index.knowsCode(code, dev)) : null;
+    const codes: CodeEntry[] = [];
+    for (const e of [...store.index.lookupCodes(q, dev), ...(data ? store.index.codesNamed(data.codes.map((x) => x.code), dev, 6) : [])]) {
+      if (codes.length < 6 && !codes.some((x) => x.code === e.code && x.docId === e.docId)) codes.push(e);
+    }
+    const srcs = hits.map((e) => ({ title: e.doc.title, h: e.doc.chunks[e.ci].h, t: e.doc.chunks[e.ci].t }));
+    const quick = {
+      codes: codes.map((e) => ({ code: e.code, text: e.text, device: e.device, title: e.title })),
+      sols: sols.map((e) => solView(e.sol, c)),
+      docs: srcs.slice(0, 4),
+      data,
+    };
+    return { hits, sols, codes, srcs, quick, data };
+  }
+
+  // The instant results on their own. The app asks for them first when photos or a file still have to
+  // be uploaded, so the technician is not kept waiting for the upload to see what is already known.
+  r.post('/search', wrap((req, res) => {
+    const b = parse(z.object({ q: z.string().max(4000).default(''), dev: z.string().max(200).default('') }), req.body);
+    res.json({ quick: instant(b.q.trim(), b.dev, req.ctx).quick });
+  }));
+
+  /**
+   * Finished answers to plain-text questions. The same fault typed again - by anyone - is answered at once
+   * for as long as the manuals and solutions the answer was made from have not changed.
+   */
+  const answers = new Map<string, { res: Diagnosis; at: number; kb: number }>();
+  const ANSWER_TTL = 7 * DAY;
+  const answerKey = (q: string, dev: string, lang: Lang) => sha256(`${lang}\n${fold(dev).replace(/\s+/g, ' ').trim()}\n${fold(q).replace(/\s+/g, ' ').trim()}`);
+  const remember = (key: string, result: Diagnosis) => {
+    answers.delete(key);
+    answers.set(key, { res: result, at: Date.now(), kb: store.kbVersion });
+    if (answers.size > 500) answers.delete(answers.keys().next().value!); // the oldest goes
+  };
+
   r.post('/diagnose', body('24mb'), wrap(async (req, res) => {
     const c = req.ctx;
     const b = parse(z.object({
@@ -605,51 +657,28 @@ export function createRouter(store: Store, deps: Deps) {
       images: z.array(ImageZ).max(4).default([]),
       image: ImageZ.nullable().optional(), // a single photo, as older app versions send it
       file: FileZ.nullable().optional(),
+      fresh: z.boolean().default(false), // "generate again": do not reuse a stored answer
     }), req.body);
     const q = b.q.trim();
     const images = [...b.images, ...(b.image ? [b.image] : [])].slice(0, 4).map((im) => checkImage(im)!);
     const file = await checkFile(b.file);
     if (!q && !images.length && !file) throw bad('need_input');
 
-    // Step 1 — instant, no AI: what the manuals and other technicians already say about this.
-    const qq = `${q} ${b.dev}`;
-    const hits = forDevice(store.index.search(qq, b.dev, 24, 'doc'), b.dev, (e) => devOf(e.doc), 8);
-    // Never suggest a fix that failed for others or that the AI pre-check flagged as dangerous.
-    const sols = forDevice(
-      store.index.search(qq, b.dev, 24, 'sol').filter((e) => solStatus(e.sol) !== 'rej' && !e.sol.ai?.safe),
-      b.dev, (e) => devOf(e.sol), 4,
-    );
-    const codes = store.index.lookupCodes(q, b.dev);
-    const srcs = hits.map((e) => ({ title: e.doc.title, h: e.doc.chunks[e.ci].h, t: e.doc.chunks[e.ci].t }));
-    const quick = {
-      codes: codes.map((e) => ({ code: e.code, text: e.text, device: e.device, title: e.title })),
-      sols: sols.map((e) => solView(e.sol, c)),
-      docs: srcs.slice(0, 4),
-    };
+    const { hits, sols, codes, srcs, quick, data } = instant(q, b.dev, c, file);
     const streaming = wantsStream(req);
-
-    if (!AI.aiConfigured()) {
-      // No AI key on the server: the instant results are the answer.
-      if (!streaming) { res.json({ quick, item: null }); return; }
+    /** Answer with the instant results and, when there is one, the finished record. */
+    const reply = (item: ReturnType<typeof historyView> | null) => {
+      if (!streaming) { res.json({ quick, item }); return; }
       const out = ndjson(res);
       out.send({ type: 'quick', quick });
-      out.send({ type: 'done', item: null });
+      out.send({ type: 'done', item });
       out.end();
-      return;
-    }
+    };
 
-    const plan = PLANS[c.user.plan];
-    if (store.usedToday(c.user) >= plan.quota) throw new HttpError(402, 'quota');
-    if ((images.length || file) && !plan.photo) throw new HttpError(402, 'photo_plan');
-    // "Unlimited" plans still have a ceiling, so a stolen or scripted account can't run up the AI bill.
-    limit(`ai:${c.user.id}`, 40, 10 * MIN, 'slow_down');
-    limit(`ai-day:${c.user.id}`, 300, DAY, 'slow_down');
+    // No AI key on the server: the instant results are the answer.
+    if (!AI.aiConfigured()) { reply(null); return; }
 
-    // Count the request before the (slow) AI call so parallel requests can't slip past the daily quota.
-    c.user.usage.n = store.usedToday(c.user) + 1;
-    const refund = () => { c.user.usage.n = Math.max(0, store.usedToday(c.user) - 1); }; // failed calls don't use up the quota
-    const input: ai.DiagnoseInput = { q, dev: b.dev, hits, sols, codes, images, file, lang: c.lang };
-    const record = (result: Diagnosis) => {
+    const record = (result: Diagnosis, stored = false) => {
       const used = result.community.map((n) => sols[n - 1]).filter(Boolean).map((e) => e.sol.id);
       const item: HistoryItem = {
         id: uid(), q, dev: b.dev, date: todayKey(), res: result, done: {}, follow: [],
@@ -657,6 +686,8 @@ export function createRouter(store: Store, deps: Deps) {
         srcs, codes: quick.codes,
         // Only the fact that something was attached is kept, never the photo or file itself.
         attached: images.length || file ? { photos: images.length, file: file?.name ?? '' } : undefined,
+        data: data ?? undefined,
+        stored: stored || undefined,
       };
       c.user.history.unshift(item);
       c.user.history = c.user.history.slice(0, 20);
@@ -664,21 +695,43 @@ export function createRouter(store: Store, deps: Deps) {
       return historyView(item, c);
     };
 
+    // A plain-text question that was answered before, from the same knowledge: no waiting, no AI call, no quota.
+    const plain = !images.length && !file;
+    const key = plain ? answerKey(q, b.dev, c.lang) : '';
+    const known = plain && !b.fresh ? answers.get(key) : undefined;
+    if (known && known.kb === store.kbVersion && Date.now() - known.at < ANSWER_TTL) { reply(record(known.res, true)); return; }
+
+    const plan = PLANS[c.user.plan];
+    if (store.usedToday(c.user) >= plan.quota) throw new HttpError(402, 'quota');
+    if (!plain && !plan.photo) throw new HttpError(402, 'photo_plan');
+    // "Unlimited" plans still have a ceiling, so a stolen or scripted account can't run up the AI bill.
+    limit(`ai:${c.user.id}`, 40, 10 * MIN, 'slow_down');
+    limit(`ai-day:${c.user.id}`, 300, DAY, 'slow_down');
+
+    // Count the request before the (slow) AI call so parallel requests can't slip past the daily quota.
+    c.user.usage.n = store.usedToday(c.user) + 1;
+    const refund = () => { c.user.usage.n = Math.max(0, store.usedToday(c.user) - 1); }; // failed calls don't use up the quota
+    const input: ai.DiagnoseInput = { q, dev: b.dev, hits, sols, codes, images, file, digest: data ? digestText(data) : undefined, lang: c.lang };
+    const finish = (result: Diagnosis) => {
+      if (plain) remember(key, result);
+      return record(result);
+    };
+
     if (!streaming) {
       let result: Diagnosis;
       try { result = await AI.diagnose(input); } catch (e) { refund(); throw e; }
-      res.json({ quick, item: record(result) });
+      res.json({ quick, item: finish(result) });
       return;
     }
 
-    // Step 2 — streamed: the instant results go out first, then the diagnosis as it is written.
+    // Step 2 - streamed: the instant results go out first, then the diagnosis as it is written.
     const out = ndjson(res);
     out.send({ type: 'quick', quick });
     const ctl = new AbortController();
     res.on('close', () => { if (!res.writableEnded) ctl.abort(); }); // the technician pressed Stop or left the screen
     try {
       const result = await AI.diagnose(input, { signal: ctl.signal, onPartial: (partial) => out.send({ type: 'partial', res: partial }) });
-      out.send({ type: 'done', item: record(result) });
+      out.send({ type: 'done', item: finish(result) });
     } catch (e) {
       refund();
       if (codeOf(e) === 'generic') console.error('diagnosis failed:', e instanceof Error ? e.message : 'unknown');
@@ -695,10 +748,12 @@ export function createRouter(store: Store, deps: Deps) {
     const c = req.ctx;
     const x = c.user.history.find((h) => h.id === req.params.id);
     if (!x) throw notFound();
-    const { q } = parse(z.object({ q: z.string().trim().min(1).max(1000) }), req.body);
+    const { q } = parse(z.object({ q: z.string().trim().min(1).max(2000) }), req.body);
     if (x.follow.length >= 30) throw bad('invalid_input');
     if (!AI.aiConfigured()) throw new ai.AiError('not_configured');
     limit(`ai-follow:${c.user.id}`, 60, 10 * MIN, 'slow_down');
+    // Follow-ups are not counted against the daily diagnoses, so they have a ceiling of their own.
+    limit(`ai-follow-day:${c.user.id}`, PLANS[c.user.plan].quota === Infinity ? 300 : 40, DAY, 'slow_down');
     const done = (a: string) => {
       x.follow.push({ q, a });
       store.save();
@@ -724,6 +779,20 @@ export function createRouter(store: Store, deps: Deps) {
       out.send({ type: 'error', error: codeOf(e) });
     }
     out.end();
+  }));
+
+  // A value the technician measured at a step: judged at once against the value the step expects.
+  r.post('/history/:id/readings', wrap((req, res) => {
+    const x = req.ctx.user.history.find((h) => h.id === req.params.id);
+    if (!x) throw notFound();
+    const b = parse(z.object({ i: z.number().int().min(0).max(50), value: z.string().trim().max(60) }), req.body);
+    const step = x.res.steps[b.i];
+    if (!step) throw notFound();
+    x.readings ??= {};
+    if (b.value) x.readings[b.i] = judgeReading(step.measure ?? '', b.value);
+    else delete x.readings[b.i];
+    store.save();
+    res.json({ reading: x.readings[b.i] ?? null, item: historyView(x, req.ctx) });
   }));
 
   r.patch('/history/:id/steps', wrap((req, res) => {
@@ -777,6 +846,12 @@ export function createRouter(store: Store, deps: Deps) {
     res.json({ item: solView(s, c), me: meView(c), awarded });
   }));
 
+  r.get('/solutions/:id/photo', wrap((req, res) => {
+    const s = db().sols.find((x) => x.id === req.params.id);
+    if (!s) throw notFound();
+    res.json({ photo: s.photo });
+  }));
+
   r.post('/solutions/:id/vote', wrap((req, res) => {
     const c = req.ctx;
     const s = db().sols.find((x) => x.id === req.params.id);
@@ -787,7 +862,7 @@ export function createRouter(store: Store, deps: Deps) {
     s[v]++;
     const awarded = store.reward(c.user, 'vote');
     checkReward(s);
-    store.reindex();
+    store.touchKb(); // the status is read live by the search; only cached answers are outdated
     store.save();
     res.json({ item: solView(s, c), me: meView(c), awarded });
   }));
@@ -801,7 +876,7 @@ export function createRouter(store: Store, deps: Deps) {
     if (s.userId !== c.user.id) throw forbidden();
     s.ok += NEED_OK;
     checkReward(s);
-    store.reindex();
+    store.touchKb();
     store.save();
     res.json({ item: solView(s, c), me: meView(c) });
   }));
@@ -1180,7 +1255,7 @@ export function createRouter(store: Store, deps: Deps) {
     if (!s) throw notFound();
     if (s.ai) s.ai.safe = false;
     checkReward(s);
-    store.reindex();
+    store.touchKb();
     store.save();
     audit('admin_solution_approved', { by: req.ctx.user.id, solution: s.id });
     res.json({ item: solView(s, req.ctx) });
