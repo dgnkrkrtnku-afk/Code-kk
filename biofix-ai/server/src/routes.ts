@@ -1,28 +1,60 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
+import { timingSafeEqual } from 'node:crypto';
 import { PDFParse } from 'pdf-parse';
 import { z } from 'zod';
 import * as ai from './ai.js';
+import {
+  dummyHash, hashPassword, MAX_PASSWORD, newResetCode, newSessionToken, normalizeEmail, RateLimiter,
+  RESET_MAX_ATTEMPTS, RESET_TTL_MS, resetHash, SESSION_TTL_MS, sha256, validEmail, verifyPassword, weakPassword,
+} from './auth.js';
+import { Billing, PLAY_BASE_PLANS, PLAY_SUBSCRIPTIONS, POINT_PACKS, type PlayNotification } from './billing.js';
+import { adminToken, demoPayments, rtdnSecret } from './config.js';
+import { bad, forbidden, HttpError, notFound } from './errors.js';
 import { chunkText, devOf, NEED_OK, prefixMatchCount, solStatus } from './kb.js';
+import type { Mailer } from './mailer.js';
 import { isPlan, PLANS, planForClient, planPrice, PT, PT_PER_USD, ptsFor } from './plans.js';
+import type { PlayClient } from './play.js';
 import { todayKey, uid, type Store } from './store.js';
 import type { Course, HistoryItem, Lang, Listing, Solution, User } from './types.js';
 
 /* ------------------------------------------------------------------ helpers */
 
-interface Ctx { user: User; lang: Lang; isAdmin: boolean }
+interface Ctx { user: User; lang: Lang; isAdmin: boolean; sessionKey: string }
 type Req = Request & { ctx: Ctx };
 
-export class HttpError extends Error {
-  constructor(public status: number, public code: string) { super(code); }
-}
-const bad = (code: string) => new HttpError(400, code);
-const forbidden = (code = 'forbidden') => new HttpError(403, code);
-const notFound = () => new HttpError(404, 'not_found');
+export type AiService = Pick<typeof ai, 'aiConfigured' | 'diagnose' | 'followUp' | 'precheck' | 'transcribePage'>;
+
+/** Things the router talks to outside this process; tests pass fakes. */
+export interface Deps { mailer: Mailer; play: PlayClient | null; ai?: AiService }
 
 const ImageZ = z.object({
-  data: z.string().min(16).max(12_000_000),
+  data: z.string().min(16).max(12_000_000).regex(/^[A-Za-z0-9+/]+={0,2}$/),
   mediaType: z.enum(['image/jpeg', 'image/png', 'image/webp']),
 });
+type Image = z.infer<typeof ImageZ>;
+
+/** Reject uploads that are not really the image type they claim to be (checks the file signature). */
+function checkImage(img: Image | null | undefined): Image | null {
+  if (!img) return null;
+  const head = Buffer.from(img.data.slice(0, 24), 'base64');
+  const ok = img.mediaType === 'image/jpeg' ? head.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))
+    : img.mediaType === 'image/png' ? head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+      : head.subarray(0, 4).toString('latin1') === 'RIFF' && head.subarray(8, 12).toString('latin1') === 'WEBP';
+  if (!ok) throw bad('not_image');
+  return img;
+}
+
+/** Display names appear next to other people's content: no control characters or markup. */
+const NameZ = z.string().trim().min(2).max(40).regex(/^[^\u0000-\u001f\u007f<>]*$/);
+
+/** Security-relevant events as one JSON line each, without personal data (user ids, never e-mails). */
+function audit(event: string, fields: Record<string, unknown> = {}) {
+  if (process.env.AUDIT_LOG === 'off') return;
+  console.log(JSON.stringify({ t: new Date().toISOString(), audit: event, ...fields }));
+}
+
+/** Larger request bodies are only accepted on the few routes that need them, and only after sign-in. */
+const body = (limit: string) => express.json({ limit });
 
 function parse<S extends z.ZodType>(schema: S, body: unknown): z.infer<S> {
   const r = schema.safeParse(body);
@@ -32,35 +64,50 @@ function parse<S extends z.ZodType>(schema: S, body: unknown): z.infer<S> {
 
 const wrap = (fn: (req: Req, res: Response) => unknown) =>
   (req: Request, res: Response, next: NextFunction) => {
-    Promise.resolve(fn(req as Req, res)).catch(next);
+    Promise.resolve().then(() => fn(req as Req, res)).catch(next);
   };
 
-const DEMO = () => process.env.DEMO_PAYMENTS !== 'false';
+const DEMO = demoPayments;
+const MIN = 60 * 1000;
+const HOUR = 60 * MIN;
+const DAY = 24 * HOUR;
+
+/** Constant-time comparison for secrets. */
+const safeEq = (a: string, b: string) => timingSafeEqual(Buffer.from(sha256(a)), Buffer.from(sha256(b)));
 
 /* ------------------------------------------------------------------ router */
 
-export function createRouter(store: Store) {
+export function createRouter(store: Store, deps: Deps) {
   const r = express.Router();
   const db = () => store.db;
+  const billing = new Billing(store, deps.play);
+  const limiter = new RateLimiter();
+  const AI: AiService = deps.ai ?? ai;
 
-  // Identity: the app generates a random device id and sends it on every call.
-  // Replace with real authentication (e.g. OAuth / magic link) before production.
+  const langOf = (req: Request): Lang => (req.header('x-lang') === 'en' ? 'en' : 'tr');
+  const ipOf = (req: Request) => req.ip || 'unknown';
+  const limit = (key: string, max: number, windowMs: number, code = 'too_many_attempts') => {
+    if (!limiter.take(key, max, windowMs)) throw new HttpError(429, code);
+  };
+  const adminOf = (req: Request) => {
+    const token = adminToken();
+    const given = req.header('x-admin-token');
+    if (!token || !given) return false;
+    // Guessing the developer key: after 20 wrong tries an address is locked out of it for an hour.
+    const key = `admin-fail:${ipOf(req)}`;
+    if (limiter.exhausted(key, 20)) return false;
+    if (safeEq(given, token)) return true;
+    if (limiter.take(key, 20, HOUR) && limiter.exhausted(key, 20)) audit('admin_key_lockout', { ip: ipOf(req) });
+    return false;
+  };
+
+  // Crude flood guard per address. Real DDoS protection belongs in front of the server (CDN / WAF).
   r.use((req, _res, next) => {
-    if (req.path === '/health') return next();
-    const id = String(req.header('x-user-id') || '');
-    if (!/^[A-Za-z0-9_-]{16,64}$/.test(id)) return next(new HttpError(401, 'no_user'));
-    const lang: Lang = req.header('x-lang') === 'en' ? 'en' : 'tr';
-    const token = process.env.ADMIN_TOKEN;
-    const isAdmin = !!token && req.header('x-admin-token') === token;
-    const user = store.user(id);
-    let name = '';
-    try { name = decodeURIComponent(String(req.header('x-user-name') || '')).trim().slice(0, 40); } catch { /* ignore bad encoding */ }
-    if (name && name !== user.name) { user.name = name; store.save(); }
-    (req as Req).ctx = { user, lang, isAdmin };
+    limit(`ip:${ipOf(req)}`, 6000, 5 * MIN, 'slow_down');
     next();
   });
 
-  const displayName = (c: Ctx) => c.user.name || (c.lang === 'tr' ? 'Sen' : 'You');
+  const displayName = (c: Ctx) => c.user.name || (c.lang === 'tr' ? 'Kullanıcı' : 'User');
 
   /* ---------- views */
 
@@ -69,6 +116,8 @@ export function createRouter(store: Store) {
     photo: s.photo, photoNote: s.photoNote, ok: s.ok, fail: s.fail, ai: s.ai, date: s.date,
     status: solStatus(s), mine: s.userId === c.user.id, myVote: s.votes[c.user.id] ?? null,
     canDelete: s.userId === c.user.id || c.isAdmin, checking: pendingChecks.has(s.id),
+    // Flagged as a safety risk by the AI pre-check: stays unverified until a developer clears it.
+    flagged: !!s.ai?.safe, canReview: c.isAdmin && !!s.ai?.safe,
   });
 
   const historyView = (x: HistoryItem, c: Ctx) => ({
@@ -105,13 +154,19 @@ export function createRouter(store: Store) {
     const u = c.user;
     return {
       user: {
-        id: u.id, name: u.name, plan: u.plan, billing: u.billing, points: u.points, ledger: u.ledger.slice(0, 20),
-        usedToday: store.usedToday(u), quotes: u.quotes, owned: u.owned,
+        id: u.id, email: u.email, name: u.name, plan: u.plan, planUntil: u.planUntil, billing: u.billing,
+        // The purchase token stays on the server; the app only needs to know a Play subscription exists.
+        sub: u.sub ? { productId: u.sub.productId, expiresAt: u.sub.expiresAt, autoRenew: u.sub.autoRenew } : null,
+        points: u.points, ledger: u.ledger.slice(0, 20), usedToday: store.usedToday(u), quotes: u.quotes, owned: u.owned,
       },
       plan: planForClient(u.plan),
       plans: Object.fromEntries(Object.keys(PLANS).map((k) => [k, planForClient(k as keyof typeof PLANS)])),
       pt: PT, ptPerUsd: PT_PER_USD, needOk: NEED_OK, fee: db().fee,
-      ai: ai.aiConfigured(), isAdmin: c.isAdmin, demoPayments: DEMO(),
+      ai: AI.aiConfigured(), isAdmin: c.isAdmin, demoPayments: DEMO(),
+      billing: {
+        google: billing.enabled, packageName: billing.packageName,
+        subs: PLAY_SUBSCRIPTIONS, basePlans: PLAY_BASE_PLANS, packs: POINT_PACKS,
+      },
     };
   };
 
@@ -119,10 +174,10 @@ export function createRouter(store: Store) {
 
   const pendingChecks = new Set<string>();
   function runPrecheck(s: Solution, photo: z.infer<typeof ImageZ> | null, lang: Lang) {
-    if (!ai.aiConfigured()) return;
+    if (!AI.aiConfigured()) return;
     pendingChecks.add(s.id);
     const hits = store.index.search(`${devOf(s)} ${s.symptom} ${s.steps}`, devOf(s), 5, 'doc');
-    ai.precheck(s, hits, photo, lang)
+    AI.precheck(s, hits, photo, lang)
       .then(({ ai: check, photoNote }) => {
         s.ai = check;
         if (photoNote) s.photoNote = photoNote;
@@ -133,57 +188,243 @@ export function createRouter(store: Store) {
       .finally(() => pendingChecks.delete(s.id));
   }
 
-  function checkReward(s: Solution, lang: Lang) {
+  function checkReward(s: Solution) {
     if (!s.userId || s.rewarded || solStatus(s) !== 'ver') return;
     const owner = db().users[s.userId];
     if (!owner) return;
     s.rewarded = true;
     store.award(owner, PT.verified, 'pt_verified');
-    void lang;
   }
+
+  /* ================================================================ public: health, sign-in */
+
+  r.get('/health', (_req, res) => {
+    res.json({ ok: true }); // no configuration details for anonymous callers
+  });
+
+  /** Start a session for `u` and return the token together with the profile. */
+  function signIn(req: Request, u: User) {
+    const token = newSessionToken();
+    const key = sha256(token);
+    store.addSession(key, u.id);
+    return { token, me: meView({ user: u, lang: langOf(req), isAdmin: adminOf(req), sessionKey: key }) };
+  }
+
+  r.post('/auth/register', wrap(async (req, res) => {
+    limit(`register:${ipOf(req)}`, 30, HOUR); // per IP; hospitals often share one address
+    const b = parse(z.object({ email: z.string().max(254), password: z.string().max(MAX_PASSWORD), name: NameZ }), req.body);
+    const email = normalizeEmail(b.email);
+    if (!validEmail(email)) throw bad('invalid_email');
+    if (weakPassword(b.password, email, b.name)) throw bad('weak_password');
+    if (store.findByEmail(email)) throw new HttpError(409, 'email_taken');
+    const passHash = await hashPassword(b.password);
+    if (store.findByEmail(email)) throw new HttpError(409, 'email_taken'); // registered while we were hashing
+    const u = store.createUser(email, passHash, b.name);
+    audit('register', { user: u.id });
+    res.status(201).json(signIn(req, u));
+  }));
+
+  r.post('/auth/login', wrap(async (req, res) => {
+    const b = parse(z.object({ email: z.string().max(254), password: z.string().max(MAX_PASSWORD) }), req.body);
+    const email = normalizeEmail(b.email);
+    limit(`login-ip:${ipOf(req)}`, 300, 15 * MIN);
+    limit(`login:${ipOf(req)}:${email}`, 10, 15 * MIN);
+    limit(`login-email:${email}`, 100, 15 * MIN);
+    const u = store.findByEmail(email);
+    // Always run the hash so a missing account and a wrong password take the same time.
+    const ok = await verifyPassword(b.password, u ? u.passHash : await dummyHash());
+    if (!u || !ok) {
+      audit('login_failed', { ip: ipOf(req), user: u?.id ?? null });
+      throw new HttpError(401, 'bad_credentials');
+    }
+    limiter.reset(`login:${ipOf(req)}:${email}`);
+    audit('login', { user: u.id });
+    res.json(signIn(req, u));
+  }));
+
+  r.post('/auth/forgot', wrap((req, res) => {
+    const b = parse(z.object({ email: z.string().max(254) }), req.body);
+    const email = normalizeEmail(b.email);
+    limit(`forgot-ip:${ipOf(req)}`, 10, HOUR);
+    const u = store.findByEmail(email);
+    if (u && limiter.take(`forgot:${email}`, 3, HOUR)) {
+      const code = newResetCode();
+      db().resetCodes[email] = { codeHash: resetHash(email, code), expiresAt: Date.now() + RESET_TTL_MS, attempts: 0 };
+      store.save();
+      deps.mailer.sendResetCode(email, code, langOf(req))
+        .catch((e) => console.error('reset e-mail failed:', e instanceof Error ? e.message : e));
+    }
+    // Same answer whether or not the address has an account.
+    res.json({ ok: true });
+  }));
+
+  r.post('/auth/reset', wrap(async (req, res) => {
+    const b = parse(z.object({
+      email: z.string().max(254), code: z.string().trim().regex(/^\d{6}$/), password: z.string().max(MAX_PASSWORD),
+    }), req.body);
+    const email = normalizeEmail(b.email);
+    limit(`reset-ip:${ipOf(req)}`, 30, HOUR);
+    const rc = db().resetCodes[email];
+    const u = store.findByEmail(email);
+    if (weakPassword(b.password, email, u?.name)) throw bad('weak_password');
+    if (!rc || !u || rc.expiresAt < Date.now() || rc.attempts >= RESET_MAX_ATTEMPTS) throw bad('bad_code');
+    rc.attempts++;
+    store.save();
+    if (!safeEq(rc.codeHash, resetHash(email, b.code))) throw bad('bad_code');
+    delete db().resetCodes[email];
+    u.passHash = await hashPassword(b.password);
+    store.dropSessions(u.id); // sign out everywhere
+    audit('password_reset', { user: u.id });
+    res.json(signIn(req, u));
+  }));
+
+  // Google Play real-time developer notifications (Pub/Sub push). Authenticated by a secret in the URL.
+  r.post('/billing/rtdn', wrap(async (req, res) => {
+    const secret = rtdnSecret();
+    const given = typeof req.query.token === 'string' ? req.query.token : '';
+    if (!secret || !given || !safeEq(given, secret)) throw forbidden();
+    const data = (req.body as { message?: { data?: unknown } } | undefined)?.message?.data;
+    if (typeof data === 'string') {
+      let n: PlayNotification | null = null;
+      try { n = JSON.parse(Buffer.from(data, 'base64').toString('utf8')) as PlayNotification; } catch { /* not ours */ }
+      if (n) await billing.handleNotification(n);
+    }
+    res.status(204).end();
+  }));
+
+  /* ================================================================ everything below needs a session */
+
+  r.use(async (req, _res, next) => {
+    const m = /^Bearer (\S+)$/.exec(req.header('authorization') || '');
+    const key = m ? sha256(m[1]) : '';
+    const sess = key ? db().sessions[key] : undefined;
+    const now = Date.now();
+    const user = sess ? db().users[sess.userId] : undefined;
+    if (!sess || !user || now - sess.lastSeen > SESSION_TTL_MS) {
+      if (sess) { delete db().sessions[key]; store.save(); }
+      throw new HttpError(401, 'no_session');
+    }
+    if (now - sess.lastSeen > HOUR) { sess.lastSeen = now; store.save(); }
+    // Per-account ceilings, far above what the app itself ever sends.
+    limit(`user:${user.id}`, 900, 5 * MIN, 'slow_down');
+    if (req.method !== 'GET') limit(`write:${user.id}`, 240, 10 * MIN, 'slow_down');
+    billing.lapse(user, now);
+    await billing.refresh(user, false, now);
+    (req as Req).ctx = { user, lang: langOf(req), isAdmin: adminOf(req), sessionKey: key };
+    next();
+  });
+
+  // Developer panel: checked here, before any large request body is read.
+  r.use('/admin', (req, _res, next) => {
+    if (!(req as Req).ctx.isAdmin) throw forbidden('admin_only');
+    next();
+  });
 
   /* ================================================================ account */
 
-  r.get('/health', (_req, res) => { res.json({ ok: true, ai: ai.aiConfigured(), model: ai.MODEL }); });
+  r.post('/auth/logout', wrap((req, res) => {
+    delete db().sessions[req.ctx.sessionKey];
+    store.save();
+    res.json({ ok: true });
+  }));
+
+  r.post('/auth/logout-all', wrap((req, res) => {
+    store.dropSessions(req.ctx.user.id);
+    audit('logout_all', { user: req.ctx.user.id });
+    res.json({ ok: true });
+  }));
 
   r.get('/me', wrap((req, res) => { res.json(meView(req.ctx)); }));
 
   r.patch('/me', wrap((req, res) => {
-    const b = parse(z.object({ billing: z.enum(['month', 'year']).optional() }), req.body);
+    const b = parse(z.object({
+      billing: z.enum(['month', 'year']).optional(), name: NameZ.optional(),
+    }), req.body);
     if (b.billing) req.ctx.user.billing = b.billing;
+    if (b.name) req.ctx.user.name = b.name;
     store.save();
     res.json(meView(req.ctx));
+  }));
+
+  r.post('/me/password', wrap(async (req, res) => {
+    const u = req.ctx.user;
+    limit(`password:${u.id}`, 10, 15 * MIN);
+    const b = parse(z.object({ current: z.string().max(MAX_PASSWORD), next: z.string().max(MAX_PASSWORD) }), req.body);
+    if (weakPassword(b.next, u.email, u.name)) throw bad('weak_password');
+    if (!(await verifyPassword(b.current, u.passHash))) throw new HttpError(403, 'bad_credentials');
+    u.passHash = await hashPassword(b.next);
+    store.dropSessions(u.id, req.ctx.sessionKey); // other devices are signed out
+    audit('password_changed', { user: u.id });
+    res.json({ ok: true });
+  }));
+
+  r.post('/me/delete', wrap(async (req, res) => {
+    const u = req.ctx.user;
+    limit(`password:${u.id}`, 10, 15 * MIN);
+    const b = parse(z.object({ password: z.string().max(MAX_PASSWORD) }), req.body);
+    if (!(await verifyPassword(b.password, u.passHash))) throw new HttpError(403, 'bad_credentials');
+    store.deleteUser(u.id);
+    audit('account_deleted', { user: u.id });
+    res.json({ ok: true });
   }));
 
   r.post('/me/plan', wrap((req, res) => {
     const b = parse(z.object({ plan: z.string(), how: z.enum(['card', 'pts']) }), req.body);
     if (!isPlan(b.plan)) throw bad('invalid_plan');
     const u = req.ctx.user;
-    const price = planPrice(b.plan, u.billing);
-    if (price > 0 && b.how === 'pts') {
-      const pp = ptsFor(price);
-      if (u.points < pp) throw bad('not_enough_points');
-      store.award(u, -pp, 'pt_spend');
-    } else if (price > 0 && !DEMO()) {
-      // Production: verify a Google Play Billing purchase token here before activating.
-      throw new HttpError(501, 'billing_not_configured');
+    // A Play subscription is changed or cancelled in Google Play, not here.
+    if (u.sub) throw new HttpError(409, 'manage_in_play');
+    if (b.plan === 'free') {
+      u.plan = 'free';
+      u.planUntil = null;
+    } else {
+      if (b.how === 'pts') {
+        const pp = ptsFor(planPrice(b.plan, u.billing));
+        if (u.points < pp) throw bad('not_enough_points');
+        store.award(u, -pp, 'pt_spend');
+      } else if (!DEMO()) {
+        throw bad('use_play'); // real card payments go through /billing/google/subscription
+      }
+      // Buying the plan you already have extends it; a different plan starts now.
+      const now = Date.now();
+      const from = u.plan === b.plan && u.planUntil && Date.parse(u.planUntil) > now ? Date.parse(u.planUntil) : now;
+      const until = new Date(from);
+      if (u.billing === 'year') until.setUTCFullYear(until.getUTCFullYear() + 1);
+      else until.setUTCMonth(until.getUTCMonth() + 1);
+      u.plan = b.plan;
+      u.planUntil = until.toISOString();
     }
-    u.plan = b.plan;
     store.save();
     res.json(meView(req.ctx));
   }));
 
-  r.post('/me/reset', wrap((req, res) => {
-    const u = req.ctx.user;
-    delete db().users[u.id];
-    db().sols = db().sols.filter((s) => s.userId !== u.id);
-    db().reviews = db().reviews.filter((x) => x.userId !== u.id);
-    db().courses = db().courses.filter((c) => c.ownerId !== u.id);
-    db().listings = db().listings.filter((l) => l.ownerId !== u.id);
-    db().sols.forEach((s) => { delete s.votes[u.id]; });
-    store.reindex();
-    req.ctx.user = store.user(u.id);
-    res.json(meView(req.ctx));
+  /* ================================================================ payments */
+
+  const PurchaseZ = z.object({ productId: z.string().min(1).max(100), purchaseToken: z.string().min(10).max(4000) });
+
+  r.post('/billing/google/subscription', wrap(async (req, res) => {
+    const b = parse(PurchaseZ, req.body);
+    await billing.activateSubscription(req.ctx.user, b.productId, b.purchaseToken);
+    audit('subscription_verified', { user: req.ctx.user.id, product: b.productId });
+    res.json({ me: meView(req.ctx) });
+  }));
+
+  r.post('/billing/google/points', wrap(async (req, res) => {
+    const b = parse(PurchaseZ, req.body);
+    const credited = await billing.creditPoints(req.ctx.user, b.productId, b.purchaseToken);
+    if (credited) audit('points_purchased', { user: req.ctx.user.id, product: b.productId, points: credited });
+    res.json({ credited, me: meView(req.ctx) });
+  }));
+
+  // Demo only: top up points without Google Play (Expo Go, web, local testing).
+  r.post('/billing/demo/points', wrap((req, res) => {
+    if (!DEMO()) throw forbidden();
+    const { productId } = parse(z.object({ productId: z.string() }), req.body);
+    const pack = POINT_PACKS.find((p) => p.productId === productId);
+    if (!pack) throw bad('unknown_product');
+    store.award(req.ctx.user, pack.points, 'pt_buy');
+    store.save();
+    res.json({ credited: pack.points, me: meView(req.ctx) });
   }));
 
   /* ================================================================ assistant */
@@ -193,18 +434,20 @@ export function createRouter(store: Store) {
     res.json({ devices: list });
   }));
 
-  r.post('/diagnose', wrap(async (req, res) => {
+  r.post('/diagnose', body('16mb'), wrap(async (req, res) => {
     const c = req.ctx;
     const b = parse(z.object({ q: z.string().max(4000).default(''), dev: z.string().max(200).default(''), image: ImageZ.nullable().optional() }), req.body);
     const q = b.q.trim();
-    if (!q && !b.image) throw bad('need_input');
+    const image = checkImage(b.image);
+    if (!q && !image) throw bad('need_input');
     const qq = `${q} ${b.dev}`;
     const hits = store.index.search(qq, b.dev, 7, 'doc');
-    const sols = store.index.search(qq, b.dev, 5, 'sol')
-      .filter((e) => solStatus(e.sol) !== 'rej' && !(e.sol.ai?.safe && solStatus(e.sol) !== 'ver'))
+    // Never suggest a fix that failed for others or that the AI pre-check flagged as dangerous.
+    const sols = store.index.search(qq, b.dev, 8, 'sol')
+      .filter((e) => solStatus(e.sol) !== 'rej' && !e.sol.ai?.safe)
       .slice(0, 4);
 
-    if (!ai.aiConfigured()) {
+    if (!AI.aiConfigured()) {
       res.json({
         offline: {
           docs: hits.slice(0, 4).map((e) => ({ title: e.doc.title, h: e.doc.chunks[e.ci].h, t: e.doc.chunks[e.ci].t })),
@@ -215,9 +458,20 @@ export function createRouter(store: Store) {
     }
     const plan = PLANS[c.user.plan];
     if (store.usedToday(c.user) >= plan.quota) throw new HttpError(402, 'quota');
-    if (b.image && !plan.photo) throw new HttpError(402, 'photo_plan');
+    if (image && !plan.photo) throw new HttpError(402, 'photo_plan');
+    // "Unlimited" plans still have a ceiling, so a stolen or scripted account can't run up the AI bill.
+    limit(`ai:${c.user.id}`, 40, 10 * MIN, 'slow_down');
+    limit(`ai-day:${c.user.id}`, 300, DAY, 'slow_down');
 
-    const result = await ai.diagnose(q, b.dev, hits, sols, b.image ?? null, c.lang);
+    // Count the request before the (slow) AI call so parallel requests can't slip past the daily quota.
+    c.user.usage.n = store.usedToday(c.user) + 1;
+    let result;
+    try {
+      result = await AI.diagnose(q, b.dev, hits, sols, image, c.lang);
+    } catch (e) {
+      c.user.usage.n = Math.max(0, store.usedToday(c.user) - 1); // failed calls don't use up the quota
+      throw e;
+    }
     const used = result.community.map((n) => sols[n - 1]).filter(Boolean).map((e) => e.sol.id);
     const item: HistoryItem = {
       id: uid(), q, dev: b.dev, date: todayKey(), res: result, done: {}, follow: [],
@@ -226,7 +480,6 @@ export function createRouter(store: Store) {
     };
     c.user.history.unshift(item);
     c.user.history = c.user.history.slice(0, 20);
-    c.user.usage.n = store.usedToday(c.user) + 1;
     store.save();
     res.json({ item: historyView(item, c) });
   }));
@@ -240,7 +493,9 @@ export function createRouter(store: Store) {
     const x = c.user.history.find((h) => h.id === req.params.id);
     if (!x) throw notFound();
     const { q } = parse(z.object({ q: z.string().trim().min(1).max(1000) }), req.body);
-    const a = await ai.followUp(x, q, c.lang);
+    if (x.follow.length >= 30) throw bad('invalid_input');
+    limit(`ai-follow:${c.user.id}`, 60, 10 * MIN, 'slow_down');
+    const a = await AI.followUp(x, q, c.lang);
     x.follow.push({ q, a });
     store.save();
     res.json({ item: historyView(x, c) });
@@ -267,29 +522,34 @@ export function createRouter(store: Store) {
       if (tab === 'verify') return s.userId !== c.user.id && !s.votes[c.user.id] && solStatus(s) === 'pen';
       return true;
     });
-    res.json({ items: list.map((s) => solView(s, c)) });
+    res.json({ items: list.slice(0, 200).map((s) => solView(s, c)) });
   }));
 
-  r.post('/solutions', wrap((req, res) => {
+  r.post('/solutions', body('16mb'), wrap((req, res) => {
     const c = req.ctx;
     const b = parse(z.object({
       brand: z.string().trim().max(80).default(''), model: z.string().trim().max(120).default(''),
       symptom: z.string().trim().min(5).max(300), code: z.string().trim().max(40).default(''),
       steps: z.string().trim().min(20).max(6000), part: z.string().trim().max(300).default(''),
-      photo: ImageZ.nullable().optional(), photoPreview: z.string().max(400_000).optional(),
+      photo: ImageZ.nullable().optional(),
     }), req.body);
     if (!b.brand && !b.model) throw bad('need_device');
+    const photo = checkImage(b.photo);
+    limit(`teach:${c.user.id}`, 20, DAY, 'slow_down');
     const s: Solution = {
       id: uid(), userId: c.user.id, by: displayName(c), brand: b.brand, model: b.model, symptom: b.symptom, code: b.code,
-      steps: b.steps, part: b.part, photo: b.photoPreview || '', photoNote: '', ok: 0, fail: 0, votes: {}, ai: null,
-      rewarded: false, date: todayKey(),
+      steps: b.steps, part: b.part,
+      // The preview other users see is built here from the verified upload. The app never supplies a URL,
+      // so a solution can't point other people's phones at a third-party server.
+      photo: photo && photo.data.length <= 400_000 ? `data:${photo.mediaType};base64,${photo.data}` : '',
+      photoNote: '', ok: 0, fail: 0, votes: {}, ai: null, rewarded: false, date: todayKey(),
     };
     db().sols.unshift(s);
-    store.award(c.user, PT.teach, 'pt_teach');
+    const awarded = store.reward(c.user, 'teach');
     store.reindex();
     store.save();
-    runPrecheck(s, b.photo ?? null, c.lang);
-    res.json({ item: solView(s, c), me: meView(c) });
+    runPrecheck(s, photo, c.lang);
+    res.json({ item: solView(s, c), me: meView(c), awarded });
   }));
 
   r.post('/solutions/:id/vote', wrap((req, res) => {
@@ -300,11 +560,11 @@ export function createRouter(store: Store) {
     if (s.userId === c.user.id || s.votes[c.user.id]) throw bad('cannot_vote');
     s.votes[c.user.id] = v;
     s[v]++;
-    store.award(c.user, PT.vote, 'pt_vote');
-    checkReward(s, c.lang);
+    const awarded = store.reward(c.user, 'vote');
+    checkReward(s);
     store.reindex();
     store.save();
-    res.json({ item: solView(s, c), me: meView(c) });
+    res.json({ item: solView(s, c), me: meView(c), awarded });
   }));
 
   // Demo only: lets a tester see the verification reward without three other accounts.
@@ -315,7 +575,7 @@ export function createRouter(store: Store) {
     if (!s) throw notFound();
     if (s.userId !== c.user.id) throw forbidden();
     s.ok += NEED_OK;
-    checkReward(s, c.lang);
+    checkReward(s);
     store.reindex();
     store.save();
     res.json({ item: solView(s, c), me: meView(c) });
@@ -379,7 +639,7 @@ export function createRouter(store: Store) {
       if (c.user.points < pp) throw bad('not_enough_points');
       store.award(c.user, -pp, 'pt_spend');
     } else if (!DEMO()) {
-      throw new HttpError(501, 'billing_not_configured');
+      throw bad('use_points'); // outside demo mode courses are paid with points (bought through Google Play)
     }
     c.user.owned.push(co.id);
     sell(co);
@@ -473,6 +733,7 @@ export function createRouter(store: Store) {
     if (!l) throw notFound();
     const b = parse(z.object({ qty: z.number().int().min(1).max(100000), msg: z.string().trim().max(2000).default('') }), req.body);
     c.user.quotes.unshift({ id: l.id, title: c.lang === 'tr' ? l.tr : l.en, seller: l.seller, usd: l.usd, qty: b.qty, msg: b.msg, date: todayKey() });
+    c.user.quotes = c.user.quotes.slice(0, 50);
     // Production: forward the request to the seller (email / in-app inbox).
     store.save();
     res.json({ me: meView(c) });
@@ -503,17 +764,18 @@ export function createRouter(store: Store) {
   r.post('/listings/:id/report', wrap((req, res) => {
     const l = db().listings.find((x) => x.id === req.params.id);
     if (!l) throw notFound();
-    db().reports.push({ listingId: l.id, userId: req.ctx.user.id, date: todayKey() });
+    const uidNow = req.ctx.user.id;
+    if (!db().reports.some((x) => x.listingId === l.id && x.userId === uidNow)) {
+      db().reports.push({ listingId: l.id, userId: uidNow, date: todayKey() });
+    }
     store.save();
     res.json({ ok: true });
   }));
 
   /* ================================================================ developer panel (admin token) */
 
-  const admin = (req: Req) => { if (!req.ctx.isAdmin) throw forbidden('admin_only'); };
 
   r.get('/admin/overview', wrap((req, res) => {
-    admin(req);
     const d = db();
     res.json({
       fee: d.fee,
@@ -528,36 +790,47 @@ export function createRouter(store: Store) {
   }));
 
   r.patch('/admin/fee', wrap((req, res) => {
-    admin(req);
     const { fee } = parse(z.object({ fee: z.number().int().min(0).max(90) }), req.body);
     db().fee = fee;
+    audit('admin_fee_changed', { by: req.ctx.user.id, fee });
     store.save();
     res.json({ fee });
   }));
 
-  r.post('/admin/docs', wrap((req, res) => {
-    admin(req);
+  r.post('/admin/docs', body('3mb'), wrap((req, res) => {
     const b = parse(z.object({
       title: z.string().trim().min(1).max(200), brand: z.string().trim().max(80).default(''), model: z.string().trim().max(120).default(''),
       text: z.string().min(20).max(2_000_000),
     }), req.body);
     const doc = { id: uid(), title: b.title, brand: b.brand, model: b.model, kind: 'manual' as const, chunks: chunkText(b.text), createdAt: todayKey() };
+    audit('admin_doc_added', { by: req.ctx.user.id, doc: doc.id });
     db().docs.unshift(doc);
     store.reindex();
     store.save();
     res.json({ id: doc.id, chunks: doc.chunks.length });
   }));
 
+  // A developer has reviewed a solution the AI flagged as a safety risk and judged it safe.
+  r.post('/admin/solutions/:id/approve', wrap((req, res) => {
+    const s = db().sols.find((x) => x.id === req.params.id);
+    if (!s) throw notFound();
+    if (s.ai) s.ai.safe = false;
+    checkReward(s);
+    store.reindex();
+    store.save();
+    audit('admin_solution_approved', { by: req.ctx.user.id, solution: s.id });
+    res.json({ item: solView(s, req.ctx) });
+  }));
+
   r.delete('/admin/docs/:id', wrap((req, res) => {
-    admin(req);
+    audit('admin_doc_deleted', { by: req.ctx.user.id, doc: req.params.id });
     db().docs = db().docs.filter((x) => x.id !== req.params.id);
     store.reindex();
     store.save();
     res.json({ ok: true });
   }));
 
-  r.post('/admin/extract-pdf', wrap(async (req, res) => {
-    admin(req);
+  r.post('/admin/extract-pdf', body('45mb'), wrap(async (req, res) => {
     const { data } = parse(z.object({ data: z.string().min(16).max(40_000_000) }), req.body);
     const parser = new PDFParse({ data: Buffer.from(data, 'base64') });
     try {
@@ -573,14 +846,12 @@ export function createRouter(store: Store) {
     }
   }));
 
-  r.post('/admin/ocr', wrap(async (req, res) => {
-    admin(req);
+  r.post('/admin/ocr', body('16mb'), wrap(async (req, res) => {
     const { image } = parse(z.object({ image: ImageZ }), req.body);
-    res.json({ text: await ai.transcribePage(image) });
+    res.json({ text: await AI.transcribePage(checkImage(image)!) });
   }));
 
   r.get('/admin/search', wrap((req, res) => {
-    admin(req);
     const q = String(req.query.q || '');
     const hits = store.index.search(q, '', 4).map((e) => (e.type === 'doc'
       ? { type: 'doc', title: e.doc.title, h: e.doc.chunks[e.ci].h, t: e.doc.chunks[e.ci].t }
@@ -600,10 +871,14 @@ export function errorHandler(err: unknown, _req: Request, res: Response, _next: 
     res.status(status).json({ error: err.code });
     return;
   }
-  if (err && typeof err === 'object' && 'type' in err && (err as { type: string }).type === 'entity.too.large') {
-    res.status(413).json({ error: 'prompt_too_large' });
+  // Errors from the JSON body parser. They carry the raw request body, so they are answered but never logged:
+  // a mistyped login request must not put a password in the log file.
+  const type = err && typeof err === 'object' && 'type' in err ? String((err as { type: unknown }).type) : '';
+  if (type === 'entity.too.large') { res.status(413).json({ error: 'prompt_too_large' }); return; }
+  if (type.startsWith('entity.') || type.startsWith('encoding.') || type.startsWith('charset.') || type === 'request.aborted' || type === 'request.size.invalid') {
+    res.status(400).json({ error: 'invalid_input' });
     return;
   }
-  console.error(err);
+  console.error(err instanceof Error ? err.stack || err.message : 'Unknown error');
   res.status(500).json({ error: 'generic' });
 }

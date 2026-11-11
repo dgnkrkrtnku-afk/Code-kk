@@ -18,7 +18,11 @@
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false,
-      "package": "com.biofix.ai"
+      "package": "com.biofix.ai",
+      "allowBackup": false,
+      "blockedPermissions": [
+        "android.permission.RECORD_AUDIO"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -30,9 +34,12 @@
         "expo-image-picker",
         {
           "photosPermission": "BioFix AI arıza ve onarım fotoğraflarını eklemek için fotoğraflarına erişir.",
-          "cameraPermission": "BioFix AI arızalı cihazın fotoğrafını çekmek için kameranı kullanır."
+          "cameraPermission": "BioFix AI arızalı cihazın fotoğrafını çekmek için kameranı kullanır.",
+          "microphonePermission": false
         }
-      ]
+      ],
+      "expo-iap",
+      "expo-secure-store"
     ],
     "scheme": "biofix",
     "experiments": {

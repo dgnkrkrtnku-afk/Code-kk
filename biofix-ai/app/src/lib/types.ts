@@ -7,7 +7,10 @@ export interface PlanInfo { usd: number; quota: number; sell: number; teach: boo
 
 export interface Me {
   user: {
-    id: string; name: string; plan: PlanId; billing: 'month' | 'year'; points: number;
+    id: string; email: string; name: string; plan: PlanId; planUntil: string | null; billing: 'month' | 'year';
+    /** Present while a Google Play subscription is bound to the account. */
+    sub: { productId: string; expiresAt: string; autoRenew: boolean } | null;
+    points: number;
     ledger: { n: number; why: string; date: string }[]; usedToday: number;
     quotes: { id: string; title: string; seller: string; usd: number; qty: number; msg: string; date: string }[];
     owned: string[];
@@ -21,13 +24,25 @@ export interface Me {
   ai: boolean;
   isAdmin: boolean;
   demoPayments: boolean;
+  billing: {
+    /** True when the server can verify Google Play purchases. */
+    google: boolean;
+    packageName: string;
+    subs: Record<Exclude<PlanId, 'free'>, string>;
+    basePlans: { month: string; year: string };
+    packs: { productId: string; points: number }[];
+  };
 }
+
+export interface AuthResult { token: string; me: Me }
 
 export interface SolutionView {
   id: string; by: string; brand: string; model: string; symptom: string; code: string; steps: string; part: string;
   photo: string; photoNote: string; ok: number; fail: number; date: string;
   ai: { v: 'consistent' | 'conflict' | 'not_covered'; note: string; safe: boolean } | null;
   status: SolStatus; mine: boolean; myVote: 'ok' | 'fail' | null; canDelete: boolean; checking: boolean;
+  /** The AI pre-check flagged a safety risk; it stays unverified until a developer clears it. */
+  flagged: boolean; canReview: boolean;
 }
 
 export interface Diagnosis {

@@ -76,17 +76,51 @@ export interface LedgerEntry { n: number; why: string; date: string }
 export interface Quote { id: string; title: string; seller: string; usd: number; qty: number; msg: string; date: string }
 export interface Sale { courseId: string; title: string; usd: number; fee: number; sellerId: string | null; date: string }
 
+/** A verified Google Play subscription bound to a user. */
+export interface Subscription {
+  source: 'google';
+  productId: string;
+  basePlanId: string;
+  token: string;
+  expiresAt: string;      // ISO time
+  autoRenew: boolean;
+  state: string;          // Google's SUBSCRIPTION_STATE_*
+  checkedAt: string;      // last time it was re-verified with Google
+}
+
 export interface User {
   id: string;
+  email: string;
+  passHash: string;
+  createdAt: string;
   name: string;
   plan: PlanId;
+  /** Paid plans are valid until this ISO time; null for the free plan. */
+  planUntil: string | null;
+  sub: Subscription | null;
   billing: 'month' | 'year';
   points: number;
   ledger: LedgerEntry[];
   usage: { d: string; n: number };
+  /** How many rewarded actions the user did today (see DAILY_REWARDS). */
+  earned?: { d: string; teach: number; vote: number };
   history: HistoryItem[];
   owned: string[];
   quotes: Quote[];
+}
+
+export interface Session { userId: string; createdAt: number; lastSeen: number }
+export interface ResetCode { codeHash: string; expiresAt: number; attempts: number }
+
+/** A Play purchase token that has already been used, so it can't be credited twice. */
+export interface PurchaseRecord {
+  userId: string;
+  kind: 'points' | 'subscription';
+  productId: string;
+  points: number;
+  orderId: string;
+  date: string;
+  voided: boolean;
 }
 
 export interface Db {
@@ -99,5 +133,11 @@ export interface Db {
   listings: Listing[];
   sales: Sale[];
   users: Record<string, User>;
+  /** Keyed by SHA-256 of the session token. */
+  sessions: Record<string, Session>;
+  /** Keyed by e-mail. */
+  resetCodes: Record<string, ResetCode>;
+  /** Keyed by SHA-256 of the Play purchase token. */
+  purchases: Record<string, PurchaseRecord>;
   reports: { listingId: string; userId: string; date: string }[];
 }

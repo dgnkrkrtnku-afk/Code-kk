@@ -77,9 +77,16 @@ export default function Course() {
         </>
       ) : co.owned ? null : (
         <>
-          <Text style={{ fontFamily: MONO, fontSize: 22, fontWeight: '700', color: c.ink, marginVertical: 8 }}>{money(co.usd)}</Text>
-          <Btn full busy={busy === 'card'} disabled={!me?.demoPayments} title={t('e_buy')} onPress={() => buy('card')} />
-          <Btn full kind="sec" style={{ marginTop: 8 }} busy={busy === 'pts'} disabled={(me?.user.points ?? 0) < pp} title={t('e_buy_pts', num(pp))} onPress={() => buy('pts')} />
+          <Text style={{ fontFamily: MONO, fontSize: 22, fontWeight: '700', color: c.ink, marginTop: 8 }}>{money(co.usd)}</Text>
+          <P small muted mono style={{ marginBottom: 8 }}>{`${num(pp)} ${t('pts')}`}</P>
+          <Btn full busy={busy === 'pts'} disabled={(me?.user.points ?? 0) < pp} title={t('e_buy_pts', num(pp))} onPress={() => buy('pts')} />
+          {(me?.user.points ?? 0) < pp ? (
+            <>
+              <P small muted style={{ marginTop: 8 }}>{t('b_need_points')}</P>
+              <Btn full kind="sec" style={{ marginTop: 8 }} title={t('b_points_t')} onPress={() => router.push('/puan')} />
+            </>
+          ) : null}
+          {me?.demoPayments ? <Btn full kind="ghost" busy={busy === 'card'} title={t('e_buy')} onPress={() => buy('card')} /> : null}
         </>
       )}
       {co.canDelete && !co.mine ? <Btn full kind="ghost" busy={busy === 'del'} title={t('e_del')} onPress={remove} /> : null}

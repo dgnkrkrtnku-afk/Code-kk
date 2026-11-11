@@ -34,10 +34,11 @@ export function chunkText(text: string): Chunk[] {
 }
 
 export const NEED_OK = 3;
-export function solStatus(s: Pick<Solution, 'ok' | 'fail'>): SolStatus {
+export function solStatus(s: Pick<Solution, 'ok' | 'fail'> & { ai?: Solution['ai'] }): SolStatus {
   const n = s.ok + s.fail;
-  if (s.ok >= NEED_OK && s.ok / n >= 0.75) return 'ver';
   if (s.fail >= NEED_OK && s.fail > s.ok) return 'rej';
+  // A fix the AI pre-check flagged as dangerous is never "verified" by votes alone; a developer must clear it.
+  if (s.ok >= NEED_OK && s.ok / n >= 0.75) return s.ai?.safe ? 'pen' : 'ver';
   return 'pen';
 }
 

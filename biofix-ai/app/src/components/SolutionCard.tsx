@@ -16,22 +16,26 @@ export function SolutionCard({ s, open, onChange, onDelete }: {
   const pt = me?.pt.vote ?? 5;
   const needOk = me?.needOk ?? 3;
 
-  async function act(kind: 'ok' | 'fail' | 'sim' | 'del') {
+  async function act(kind: 'ok' | 'fail' | 'sim' | 'del' | 'approve') {
     setBusy(kind);
     try {
       if (kind === 'del') {
         await api.del(`/solutions/${s.id}`);
         onDelete?.(s.id);
         toast(t('c_deleted'));
-      } else {
-        const r = kind === 'sim'
-          ? await api.post<{ item: SolutionView; me: Me }>(`/solutions/${s.id}/simulate`)
-          : await api.post<{ item: SolutionView; me: Me }>(`/solutions/${s.id}/vote`, { v: kind });
-        const wasVerified = me && r.me.user.points - me.user.points >= (me.pt.verified ?? 100);
+      } else if (kind === 'approve') {
+        onChange?.((await api.post<{ item: SolutionView }>(`/admin/solutions/${s.id}/approve`)).item);
+      } else if (kind === 'sim') {
+        const r = await api.post<{ item: SolutionView; me: Me }>(`/solutions/${s.id}/simulate`);
+        const verified = !!me && r.me.user.points - me.user.points >= me.pt.verified;
         setMe(r.me);
         onChange?.(r.item);
-        if (kind !== 'sim') toast(t('v_thanks', pt));
-        else if (wasVerified) toast(t('f_verified', me?.pt.verified ?? 100));
+        if (verified) toast(t('f_verified', r.me.pt.verified));
+      } else {
+        const r = await api.post<{ item: SolutionView; me: Me; awarded: number }>(`/solutions/${s.id}/vote`, { v: kind });
+        setMe(r.me);
+        onChange?.(r.item);
+        toast(r.awarded ? t('v_thanks', r.awarded) : t('v_thanks_cap'));
       }
       bump();
     } catch (e) {
@@ -72,6 +76,7 @@ export function SolutionCard({ s, open, onChange, onDelete }: {
             {s.ai.safe ? <Badge tone="bad">{'⚠ ' + t('ai_safe')}</Badge> : null}
           </Row>
           {s.ai.note ? <P small muted style={{ marginTop: 5 }}>{s.ai.note}</P> : null}
+          {s.flagged ? <P small muted style={{ marginTop: 5 }}>{t('c_review')}</P> : null}
         </View>
       ) : null}
 
@@ -86,6 +91,7 @@ export function SolutionCard({ s, open, onChange, onDelete }: {
           <Badge tone="info">{t(s.myVote === 'ok' ? 'v_done_ok' : 'v_done_no')}</Badge>
         ) : null}
         {s.mine && s.status === 'pen' && me?.demoPayments ? <Btn sm kind="sec" title={t('c_sim')} busy={busy === 'sim'} onPress={() => act('sim')} /> : null}
+        {s.canReview ? <Btn sm kind="sec" title={t('c_approve')} busy={busy === 'approve'} onPress={() => act('approve')} /> : null}
         {s.canDelete ? <Btn sm kind="ghost" title={t('c_del')} busy={busy === 'del'} onPress={() => act('del')} /> : null}
       </Row>
     </Card>

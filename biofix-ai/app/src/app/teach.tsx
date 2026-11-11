@@ -1,7 +1,7 @@
 import { router, useLocalSearchParams } from 'expo-router';
 import { useState } from 'react';
 import { Image } from 'react-native';
-import { Btn, Input, Row, Screen } from '../components/ui';
+import { Btn, Input, P, Row, Screen } from '../components/ui';
 import { useApp } from '../lib/app-context';
 import { pickImage } from '../lib/media';
 import type { ImagePayload, Me, SolutionView } from '../lib/types';
@@ -9,7 +9,7 @@ import type { ImagePayload, Me, SolutionView } from '../lib/types';
 /** "Teach a solution" form. Prefilled from the assistant (device + fault). */
 export default function Teach() {
   const p = useLocalSearchParams<{ dev?: string; q?: string }>();
-  const { t, api, me, setMe, toast, errText, bump } = useApp();
+  const { t, api, setMe, toast, errText, bump } = useApp();
   const parts = (p.dev || '').split(' ');
   const [brand, setBrand] = useState(parts[0] || '');
   const [model, setModel] = useState(parts.slice(1).join(' '));
@@ -30,14 +30,13 @@ export default function Teach() {
     if (!(brand.trim() || model.trim()) || sym.trim().length < 5 || steps.trim().length < 20) { toast(t('f_need')); return; }
     setBusy(true);
     try {
-      const r = await api.post<{ item: SolutionView; me: Me }>('/solutions', {
+      const r = await api.post<{ item: SolutionView; me: Me; awarded: number }>('/solutions', {
         brand, model, symptom: sym, steps, part, code,
         photo: photo ? { data: photo.data, mediaType: photo.mediaType } : null,
-        photoPreview: photo ? `data:image/jpeg;base64,${photo.data}` : undefined,
       });
       setMe(r.me);
       bump();
-      toast(t('f_saved', me?.pt.teach ?? 20, me?.pt.verified ?? 100));
+      toast(r.awarded ? t('f_saved', r.awarded, r.me.pt.verified) : t('f_saved_cap', r.me.pt.verified));
       router.dismissTo({ pathname: '/cozumler', params: { tab: 'mine', q: '' } });
     } catch (e) {
       toast(errText(e));
@@ -59,6 +58,7 @@ export default function Teach() {
         <Input half label={t('f_code')} value={code} onChangeText={setCode} autoCapitalize="characters" />
       </Row>
       {photo ? <Image source={{ uri: photo.uri }} style={{ width: '100%', aspectRatio: 4 / 3, borderRadius: 10, marginBottom: 8 }} /> : null}
+      {photo ? <P small muted style={{ marginBottom: 8 }}>{t('a_photo_privacy')}</P> : null}
       <Row style={{ marginBottom: 12 }}>
         <Btn kind="sec" style={{ flex: 1 }} title={photo ? '✓ ' + t('f_photo_ok') : t('f_photo')} onPress={() => addPhoto('library')} />
         <Btn kind="sec" title={t('camera')} onPress={() => addPhoto('camera')} />

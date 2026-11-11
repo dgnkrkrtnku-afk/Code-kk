@@ -16,11 +16,14 @@ export const PLANS: Record<PlanId, Plan> = {
   org: { usd: 249, quota: Infinity, sell: Infinity, teach: true, photo: true },
 };
 
-export const isPlan = (k: unknown): k is PlanId => typeof k === 'string' && k in PLANS;
+// Own keys only: `'constructor' in PLANS` is true, and treating that as a plan would skip every limit.
+export const isPlan = (k: unknown): k is PlanId => typeof k === 'string' && Object.hasOwn(PLANS, k);
 
 /** Points awarded per action, and the points ⇄ USD rate. */
 export const PT = { teach: 20, verified: 100, vote: 5, review: 15 } as const;
 export const PT_PER_USD = 50;
+/** How many times a day each action earns points. More is allowed, it just isn't rewarded (anti-farming). */
+export const DAILY_REWARDS = { teach: 5, vote: 20 } as const;
 export const ptsFor = (usd: number) => Math.round(usd * PT_PER_USD);
 export const planPrice = (k: PlanId, billing: 'month' | 'year') => PLANS[k].usd * (billing === 'year' ? 10 : 1);
 

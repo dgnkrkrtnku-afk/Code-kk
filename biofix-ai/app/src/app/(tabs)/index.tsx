@@ -101,10 +101,11 @@ export default function Assistant() {
         {photo ? (
           <Row style={{ backgroundColor: c.sunk, borderRadius: 9, padding: 7, marginBottom: 10 }}>
             <Image source={{ uri: photo.uri }} style={{ width: 38, height: 38, borderRadius: 6 }} />
-            <P small style={{ flex: 1 }}>📷</P>
+            <P small style={{ flex: 1 }}>📷 {t('f_photo_ok')}</P>
             <Btn kind="ghost" sm title={t('rm')} onPress={() => setPhoto(null)} />
           </Row>
         ) : null}
+        {photo ? <P small muted style={{ marginBottom: 10 }}>{t('a_photo_privacy')}</P> : null}
         <Row>
           {!photo && me?.ai && plan?.photo ? (
             <>

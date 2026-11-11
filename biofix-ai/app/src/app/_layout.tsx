@@ -1,8 +1,11 @@
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
+import { useEffect } from 'react';
 import { ActivityIndicator, Text, View } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
-import { AppProvider, useApp } from '../lib/app-context';
+import { AuthScreen } from '../components/AuthScreen';
+import { AppProvider, CONFIG_ERROR, useApp } from '../lib/app-context';
+import { startBilling, stopBilling } from '../lib/billing';
 
 function Toast() {
   const { toastMsg, c } = useApp();
@@ -18,9 +21,38 @@ function Toast() {
 }
 
 function Shell() {
-  const { ready, c, dark, t } = useApp();
+  const { ready, c, dark, t, token, me, api, setMe } = useApp();
+  const userId = me?.user.id;
+  const playOn = !!me?.billing.google;
+
+  // Google Play connection lives as long as someone is signed in.
+  useEffect(() => {
+    if (!token || !me || !userId) return;
+    void startBilling({ api, userId, catalog: me.billing, onMe: setMe });
+    return stopBilling;
+    // Restart only when the account or the server's Play setup changes, not on every profile refresh.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, userId, playOn]);
+
   if (!ready) {
     return <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: c.bg }}><ActivityIndicator color={c.cyan} /></View>;
+  }
+  if (CONFIG_ERROR) {
+    return (
+      <View style={{ flex: 1, justifyContent: 'center', padding: 28, backgroundColor: c.bg }}>
+        <Text style={{ fontSize: 20, fontWeight: '800', color: c.ink, marginBottom: 8 }}>{t('e_config_t')}</Text>
+        <Text style={{ fontSize: 14, color: c.muted, lineHeight: 21 }}>{t('e_config_d')}</Text>
+      </View>
+    );
+  }
+  if (!token) {
+    return (
+      <View style={{ flex: 1, backgroundColor: c.bg }}>
+        <StatusBar style={dark ? 'light' : 'dark'} />
+        <AuthScreen />
+        <Toast />
+      </View>
+    );
   }
   const modal = { presentation: 'modal' as const };
   return (
@@ -37,6 +69,7 @@ function Shell() {
       >
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
         <Stack.Screen name="planlar" options={{ title: t('pl_title') }} />
+        <Stack.Screen name="puan" options={{ title: t('b_points_t') }} />
         <Stack.Screen name="gelistirici" options={{ title: t('d_title') }} />
         <Stack.Screen name="listing/[id]" options={{ title: t('p_title') }} />
         <Stack.Screen name="course/[id]" options={{ title: t('e_title') }} />
