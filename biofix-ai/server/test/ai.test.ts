@@ -589,10 +589,16 @@ test('an attached log is read at once: its codes are explained from the manual a
   assert.match(prompt.system, /"findings": interpret the data/);
   assert.match(prompt.system, /<data_summary> was computed by the app/);
 
-  // The digest is kept with the record (the file is not), so the summary is there when the record is reopened.
+  // The figures are kept with the record so the summary is there when it is reopened; nothing quoted from the file is.
   const item = r.events[r.events.length - 1].item;
   assert.equal(item.data.codes[0].code, 'E21');
-  assert.equal(JSON.stringify(app.store.db).includes('COMM timeout'), false, 'the file itself is not stored');
+  assert.equal(item.data.series[0].min, 4.52);
+  const twice = { ...file, data: Buffer.from(LOG + LOG).toString('base64') }; // now every message repeats
+  const again = await app.stream('/diagnose', { q: 'Cihaz arada bir kapanıyor, günlük uzun', dev: PM12, file: twice }, t);
+  assert.ok(again.events[0].quick.data.repeated.length > 0, 'the live summary quotes the most repeated messages');
+  assert.deepEqual(again.events[again.events.length - 1].item.data.repeated, [], 'the stored one does not');
+  assert.equal(JSON.stringify(app.store.db).includes('COMM timeout'), false, 'no line of the file is stored');
+  assert.match(prompt.system, /Never repeat personal data about patients or staff/);
 
   // Without AI on the server the summary and the code meanings are still the answer.
   const off = await makeApp();

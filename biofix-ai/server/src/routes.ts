@@ -686,7 +686,8 @@ export function createRouter(store: Store, deps: Deps) {
         srcs, codes: quick.codes,
         // Only the fact that something was attached is kept, never the photo or file itself.
         attached: images.length || file ? { photos: images.length, file: file?.name ?? '' } : undefined,
-        data: data ?? undefined,
+        // Of an attached log only the figures are kept (counts, codes, statistics), not lines quoted from it.
+        data: data ? { ...data, repeated: [] } : undefined,
         stored: stored || undefined,
       };
       c.user.history.unshift(item);

@@ -160,6 +160,10 @@ export default function Assistant() {
     }
   }
 
+  // Right after an answer the live summary is still at hand (it also quotes the most repeated messages);
+  // a record reopened later has the figures that were kept with it.
+  const shownData = hasData(quick?.data) ? quick?.data : cur?.data;
+
   /** A shortcut chip: fill in the fault and look it up straight away. */
   const run = (text: string) => { setQ(text); void solve(text); };
   const teachFrom = () => router.push({ pathname: '/teach', params: { dev, q } });
@@ -277,7 +281,7 @@ export default function Assistant() {
         </>
       ) : null}
       {/* With the finished report: what the attached data contains, and what the manual says about its codes. */}
-      {cur && hasData(cur.data) ? <DataCard data={cur.data} /> : null}
+      {cur && hasData(shownData) ? <DataCard data={shownData} /> : null}
       {cur?.codes?.length ? <CodeCards codes={cur.codes} /> : null}
 
       {/* 2. The AI diagnosis, shown while it is written and then as the saved record. */}

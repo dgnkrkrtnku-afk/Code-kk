@@ -4,7 +4,8 @@ Tıbbi cihaz arızaları için saha asistanı. Biyomedikal teknisyen ve mühendi
 fotoğraf, hata günlüğü ya da PDF ekler); asistan geliştiricilerin yüklediği servis manuellerini ve
 sahadaki kullanıcıların öğrettiği çözümleri tarayıp önce saniyesinde bulduklarını gösterir, ardından
 “ilk yapılacak iş”, adım adım kontrol listesi, olası nedenler, parça önerileri ve güvenlik uyarıları
-içeren bir iş föyü üretir.
+içeren bir iş föyü üretir. Eklenen günlük ve ölçüm tablolarını yorumlar; adımlarda ölçülen değerleri
+kılavuzdaki beklenen değerle karşılaştırır.
 
 Bu klasör, claude.ai'daki HTML prototipinin gerçek bir mobil uygulamaya dönüştürülmüş halidir.
 
@@ -58,12 +59,38 @@ Bir arıza gönderildiğinde yanıt üç katmanda gelir; ilk ikisi yapay zekâ b
 Cihaz seçilince o cihazda **çözülmüş arızalar** ve **hata kodları** tek dokunuşluk kısayol olarak çıkar.
 Cihaz listede aranmak yerine **etiketinin fotoğrafından** da seçilebilir.
 
+Bekleme süresini kısaltan diğer düzenler:
+
+* **Kayıtlı yanıt.** Yalnızca metinle sorulmuş bir arıza aynı cihaz için yeniden sorulursa (kim sorarsa sorsun)
+  AI'a gidilmez; önceki yanıt anında gösterilir ve günlük hak düşülmez. Kılavuzlar ya da çözümler
+  değişince kayıtlı yanıtlar geçersiz olur. Raporun üstündeki “Yeniden üret” yeni bir yanıt ister.
+* **Yüklemeyi beklemeyen hızlı sonuçlar.** Fotoğraf ya da dosya eklendiğinde hızlı sonuçlar ayrı ve küçük bir
+  istekle hemen gelir; yükleme arkada sürer.
+* **AI yanıt veremezse** (servis yoğun, bağlantı koptu, süre doldu) hızlı sonuçlar ekranda kalır, neden
+  açıkça yazılır ve “Yeniden dene” düğmesi çıkar. Başarısız istek günlük haktan düşmez.
+
+### Veri yorumlama
+
+* **Günlük ve tablo özeti (AI'sız, anında).** Arızaya eklenen metin dosyası bir cihaz günlüğü ya da ölçüm
+  tablosuysa sunucu onu sayarak özetler: kapsadığı zaman aralığı, hata ve uyarı satırı sayısı, geçen hata
+  kodları ve kaçar kez geçtikleri, tekrarlayan ölçümlerin en az / ortalama / en çok / son değeri ve gidişi
+  (yükseliyor, düşüyor, sabit), en çok tekrarlanan iletiler. Dosyada geçen kodların kılavuzdaki karşılığı,
+  arıza metninde hiç kod yazılmamış olsa da gösterilir.
+* **Bulgular.** AI bu kesin sayıları hazır alır ve raporda “Veriden çıkan bulgular” başlığı altında her
+  gözlemi tek tek yorumlar: ne görüldü, bu arıza için ne anlama geliyor, normal mi anormal mi. Kaynaklarda
+  karşılaştırılacak bir değer yoksa bunu “belirsiz” olarak söyler; sınır uydurmaz.
+* **Ölçüm değerlendirme.** Beklenen değeri olan her adımın yanına ölçülen değer yazılır; sunucu onu kılavuzdaki
+  ifadeyle (“5,0 V ± 0,25 V”, “4,75–5,25 V”, “en az 2 MΩ”, “max 300 µA”…) anında karşılaştırır: uygun, düşük
+  ya da yüksek, sapma yüzdesiyle. Birim dönüştürülür (4600 mV = 4,6 V). Sınır belirtilmemişse hüküm
+  verilmez. “Ölçümlere göre yeniden değerlendir” düğmesi bu değerleri AI'a götürür; AI hangi nedenin
+  güçlendiğini, hangisinin elendiğini ve sıradaki adımı yazar.
+
 ## Özellikler
 
 | Bölüm | Özellikler |
 |---|---|
 | Giriş | E-posta + şifre ile kayıt ve giriş, **e-posta doğrulama** (adrese gelen 6 haneli kod girilmeden uygulama kullanılamaz), e-postaya gelen kodla şifre sıfırlama, şifre değiştirme, tüm cihazlardan çıkış, hesap silme |
-| Asistan | Cihaz seçimi ya da etiketten okuma, cihaz kısayolları, arıza metni, en çok 4 fotoğraf ve bir PDF/metin dosyası eki (Pro+), anında hata kodu ve hızlı sonuçlar, akarak gelen teşhis, “ilk yapılacak” kutusu, güven/kaynak rozetleri, işaretlenebilir kontrol listesi, parça önerisi → Pazarda ara, güvenlik uyarıları, kullanılan kılavuz bölümleri, netleştirme soruları ve devam sorusu, durdurma, geçmiş, günlük kota |
+| Asistan | Cihaz seçimi ya da etiketten okuma, cihaz kısayolları, arıza metni, en çok 4 fotoğraf ve bir PDF/metin dosyası eki (Pro+), anında hata kodu ve hızlı sonuçlar, akarak gelen teşhis, “ilk yapılacak” kutusu, günlük/tablo veri özeti, veriden çıkan bulgular, adımlarda ölçüm girişi ve değerlendirmesi, güven/kaynak rozetleri, işaretlenebilir kontrol listesi, parça önerisi → Pazarda ara, güvenlik uyarıları, kullanılan kılavuz bölümleri, netleştirme soruları ve devam sorusu, kayıtlı yanıt / yeniden üret, hata durumunda yeniden deneme, durdurma, geçmiş, günlük kota |
 | Çözümler | Çözüm öğret (+20), AI ön incelemesi (kılavuzla uyum, güvenlik riski), “Bende çalıştı / Çalışmadı” oylaması (+5), 3 onayla doğrulama (+100), puan hareketleri |
 | Eğitim | Program listesi, önizleme/kilitli dersler, puanla satın alma, eğitici paneli (satış, kazanç, platform payı), program oluşturma (Eğitici/Kurum planı) |
 | Pazar | Kategori/durum/ülke filtresi, arama, ilan detayı, kullanıcı değerlendirmeleri (aboneler), teklif isteme, ilan verme (Ticari/Kurum planı), ilan bildirme |
@@ -134,7 +161,8 @@ Sırayla:
    | `SMTP_URL`, `MAIL_FROM` | **Zorunlu.** Kayıtta adres doğrulama kodu ve şifre sıfırlama kodu bununla gönderilir; yoksa kimse kayıt olamaz |
    | `GOOGLE_PLAY_PACKAGE`, `GOOGLE_SERVICE_ACCOUNT_FILE`, `PLAY_RTDN_SECRET` | Ödemeler için ([docs/GOOGLE-PLAY.md](docs/GOOGLE-PLAY.md)) |
    | `DEMO_PAYMENTS`, `PRINT_EMAIL_CODES` | **Olmamalı** (satırları sil) |
-   | `BIOFIX_EFFORT`, `BIOFIX_SPEED`, `MAX_ATTACH_PAGES` | İsteğe bağlı: AI yanıt hızı / maliyet ayarları (aşağıda) |
+   | `BIOFIX_EFFORT`, `BIOFIX_SPEED`, `BIOFIX_LIGHT_MODEL`, `MAX_ATTACH_PAGES` | İsteğe bağlı: AI yanıt hızı / maliyet ayarları (aşağıda) |
+   | `APP_TIMEZONE` | Günlük hakların sıfırlandığı ve tarihlerin değiştiği saat dilimi (varsayılan `Europe/Istanbul`) |
 
 3. **Uygulamayı sunucu adresiyle derle.** `app/eas.json` içinde `production` (ve deneme APK'sı için `preview`)
    profilindeki boş alanları doldur:
@@ -164,10 +192,19 @@ Yapay zekâ kullanımı Anthropic'e, okunan ve yazılan metin miktarına göre �
 
 | Ayar | Ne yapar |
 |---|---|
-| `BIOFIX_EFFORT=low\|medium\|high` | Teşhiste modelin ne kadar derin düşüneceği. Varsayılan `high` (en dikkatli). Düşürmek yanıtı hızlandırır ve ucuzlatır. |
-| `BIOFIX_SPEED=fast` | Aynı model, yaklaşık 2,5 kata kadar hızlı yazar; birim fiyat 2 katıdır. Yalnızca `claude-opus-5-5` ve `claude-fable-5-2` ile. |
+| `BIOFIX_EFFORT=low\|medium\|high\|auto` | Teşhiste modelin ne kadar derin düşüneceği. Varsayılan `high` (en dikkatli). Düşürmek yanıtı hızlandırır ve ucuzlatır. `auto`: bilgi bankasının zaten yanıtladığı arızalarda (kılavuz bildirilen kodu açıklıyor ya da o cihaz için doğrulanmış çözüm var) `medium`, geri kalanında `high`. |
+| `BIOFIX_SPEED=fast` | Aynı model, yanıtı yaklaşık 2,5 kata kadar hızlı yazar; birim fiyat 2 katıdır (`claude-opus-5-5` için 1 milyon belirteçte girdi 8 $, çıktı 40 $; normali 4 $ / 20 $). Düşünme süresini değil yazma hızını artırır. Yalnızca `claude-opus-5-5` ve `claude-fable-5-2` ile. Hızlı şerit doluysa istek beklemeden normal hızda gönderilir. |
 | `BIOFIX_MODEL` | Varsayılan `claude-opus-5-5`. Daha ucuz ve hızlı: `claude-sonnet-5-5`, `claude-haiku-5-5`. |
+| `BIOFIX_LIGHT_MODEL` | İsteğe bağlı: etiket okuma, sayfa/PDF okuma ve manuel dizinleme için daha hafif bir model (ör. `claude-haiku-5-5`). Teşhis ve çözüm ön incelemesi ana modelde kalır. |
+| `BIOFIX_AI_TIMEOUT_S` | Bir yanıt için en uzun bekleme (varsayılan 240 sn). Dolunca istek bırakılır, hak iade edilir, kullanıcıya “yeniden dene” sunulur. |
+| `BIOFIX_PARALLEL` | Manuel okuma ve dizinlemede aynı anda yürüyen AI çağrısı (varsayılan 3). |
 | `MAX_ATTACH_PAGES` | Arızaya eklenebilecek PDF'in sayfa sınırı (varsayılan 30). Her sayfa ücretlidir. |
+
+Kayıtlı yanıtlar, yüklemeyi beklemeyen hızlı sonuçlar ve fotoğrafsız listeler gibi düzenler her zaman
+açıktır ve yanıtın içeriğini değiştirmez. `BIOFIX_EFFORT` (düşük ayarlar), `BIOFIX_MODEL` ve
+`BIOFIX_LIGHT_MODEL` ise hızı kalite karşılığında, `BIOFIX_SPEED` para karşılığında artırır; bu ayarların
+yanıt kalitesine etkisi bu uygulama için **ölçülmedi** (geliştirme ortamında API anahtarı yoktu). Açmadan
+önce kendi arıza örneklerinle eski ve yeni yanıtları yan yana karşılaştır.
 
 Maliyeti en çok etkileyenler: arızaya eklenen PDF ve fotoğraflar, taranmış manuellerin AI ile okunması
 (sayfa başına) ve yeni manuelin AI ile dizinlenmesi (manuel başına bir kez). Hata kodu kartı ve hızlı

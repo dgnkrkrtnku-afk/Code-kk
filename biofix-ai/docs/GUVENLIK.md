@@ -53,7 +53,8 @@ KVKK aydınlatma metni için “Saklanan veriler” bölümünü bir hukukçuya 
 |---|---|
 | Talimat enjeksiyonu | Kurallar sistem isteminde, kullanıcı ve manuel metinleri ayrı etiketli veri bloklarında gider; metnin kendi bloğunu kapatıp talimat gibi görünmesi engellenir. |
 | Ekli dosyalar | Arızaya eklenen dosya yalnızca PDF ya da düz metin olabilir. Sunucu dosya adına ya da türüne değil **içeriğine** bakar: PDF imzası ve sayfa sayısı (en çok 30) kontrol edilir, şifreli PDF reddedilir; metin olmayan dosyalar (resim, Word, arşiv) reddedilir ve AI'a gönderilmez; metin 200 bin karakterle sınırlıdır. Ek, yalnızca fotoğrafla teşhis içeren planlarda kabul edilir. Dosyanın içeriği de “veri” olarak işaretlenir; içindeki talimatlar izlenmez. |
-| Eklerin saklanması | Eklenen fotoğraf ve dosyalar sunucuda **saklanmaz**; teşhis için Claude API'ye iletilir ve bırakılır. Geçmişte yalnızca dosyanın adı ve fotoğraf sayısı kalır. |
+| Eklerin saklanması | Eklenen fotoğraf ve dosyalar sunucuda **saklanmaz**; teşhis için Claude API'ye iletilir ve bırakılır. Geçmişte dosyanın adı, fotoğraf sayısı ve (günlük/tablo ise) yalnızca **sayısal özeti** kalır: satır sayısı, zaman aralığı, hata kodu sayıları, ölçüm adları ve istatistikleri. Dosyadan alıntılanan satırlar saklanmaz. |
+| Kayıtlı yanıtlar | Yalnızca metinle sorulan bir arızanın yanıtı sunucu belleğinde tutulur ve aynı metni aynı cihaz için yazan herkese gösterilir (en çok 7 gün, bilgi bankası değişene kadar). Fotoğraflı ya da dosyalı sorular hiçbir zaman paylaşılmaz. AI'a, soruda geçen hasta ya da personel bilgisini yanıtında tekrarlamaması söylenir; yine de arıza metnine kişisel bilgi yazılmamalıdır. |
 | Kötüye kullanım sınırları | Etiket okuma hesap başına günde 20; teşhis kotası AI çağrısından önce düşülür ve durdurulan ya da başarısız olan istekte iade edilir. Manuel okuma ve dizinleme yalnızca geliştirici anahtarıyla çalışır; aynı anda en çok 2 PDF okuma işi yürür. |
 | Tehlikeli çözümler | AI ön incelemesinin güvenlik riski işaretlediği çözüm, oy sayısı ne olursa olsun “Doğrulandı” olmaz ve başkalarının teşhisine verilmez; bir geliştirici inceleyip onaylamalıdır. |
 | Puan suistimali | Çözüm öğretme, oy verme ve doğrulanma ödülleri günlük sınırlıdır. Gerçek ödeme açıkken yeni hesaba ücretsiz puan verilmez. |
@@ -74,7 +75,7 @@ KVKK aydınlatma metni için “Saklanan veriler” bölümünü bir hukukçuya 
 | E-posta, görünen ad, şifre özeti, kayıt zamanı | Sunucu veri dosyası | Görünen ad, öğretilen çözümlerde ve yorumlarda herkese görünür. |
 | Oturum özetleri | Sunucu veri dosyası | Anahtarın kendisi yalnızca telefondadır. |
 | Plan, puan, puan hareketleri, günlük kullanım | Sunucu veri dosyası | |
-| Arıza soruları, AI yanıtları, devam soruları | Sunucu veri dosyası | Kullanıcı başına son 20 kayıt; yalnızca sahibi görür. Eklenen dosyanın yalnızca adı ve fotoğraf sayısı tutulur, kendileri tutulmaz. |
+| Arıza soruları, AI yanıtları, devam soruları, adımlara girilen ölçümler | Sunucu veri dosyası | Kullanıcı başına son 20 kayıt; yalnızca sahibi görür. Eklenen dosyanın adı, fotoğraf sayısı ve günlük/tablonun sayısal özeti tutulur; dosyanın ve fotoğrafların kendileri tutulmaz. |
 | E-posta doğrulama ve şifre sıfırlama kodları | Sunucu veri dosyası | Yalnızca özetleri; süresi dolunca silinir. |
 | Öğretilen çözümler, oylar, yorumlar, ilanlar, eğitim programları, teklif istekleri | Sunucu veri dosyası | Çözüm fotoğrafı (varsa) dahil. |
 | Satın alma kayıtları | Sunucu veri dosyası | Satın alma anahtarının özeti, ürün, sipariş numarası; abonelik anahtarı (yeniden doğrulama için). |
@@ -85,7 +86,7 @@ KVKK aydınlatma metni için “Saklanan veriler” bölümünü bir hukukçuya 
 
 | Kime | Ne | Neden |
 |---|---|---|
-| Anthropic (Claude API) | Arıza metni, seçilen cihaz, eklenen fotoğraflar ve dosya (PDF/metin), cihaz etiketi fotoğrafı, ilgili manuel bölümleri ve topluluk çözümleri; geliştiricinin yüklediği manuel sayfaları (okuma ve dizinleme için) | Teşhis üretmek, etiketi ve manuelleri okumak için. Ad, e-posta ya da hesap numarası gönderilmez. |
+| Anthropic (Claude API) | Arıza metni, seçilen cihaz, eklenen fotoğraflar ve dosya (PDF/metin) ile dosyadan çıkarılan sayısal özet, adımlara girilen ölçümler, cihaz etiketi fotoğrafı, ilgili manuel bölümleri ve topluluk çözümleri; geliştiricinin yüklediği manuel sayfaları (okuma ve dizinleme için) | Teşhis üretmek, etiketi ve manuelleri okumak için. Ad, e-posta ya da hesap numarası gönderilmez. |
 | Google Play | Satın alma anahtarı; satın almayı hesaba bağlamak için iç kullanıcı numarası | Ödeme ve doğrulama. |
 | E-posta sağlayıcın (SMTP) | E-posta adresi; doğrulama ya da sıfırlama kodu | Adres doğrulama ve şifre sıfırlama. |
 

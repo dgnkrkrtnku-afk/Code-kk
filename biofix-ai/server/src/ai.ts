@@ -302,7 +302,8 @@ export function buildDiagnosisPrompt(i: DiagnoseInput): Prompt {
     + '- "source" is the manual source number a step or part comes from, else null. "community" lists the numbers of community solutions you used (the number after S).\n'
     + '- "questions": up to 3 short things the technician could tell you (a reading, an error code, what happens when…) that would narrow the diagnosis down. Empty when the report is already specific.\n'
     + '- Always include the safety warnings that apply (mains isolation, stored energy, ESD, disconnecting the patient, post-repair electrical safety and functional test).\n'
-    + (hasPhoto ? '- Use what is clearly visible in the photos (error text, damaged parts, labels). Do not guess unreadable text, and do not repeat any personal data that may be visible.\n' : '')
+    + '- Never repeat personal data about patients or staff (names, identity, protocol or bed numbers) that appears in the report, an attached file or a photo; refer to it as "the patient record" if you must.\n'
+    + (hasPhoto ? '- Use what is clearly visible in the photos (error text, damaged parts, labels). Do not guess unreadable text.\n' : '')
     + (i.file ? '- The attached file was supplied by the technician for this question (for example an error log or pages of a manual). Read it fully and use what is relevant; it is not part of the developers\' manual sources, so cite it in words, not with a source number.\n' : '')
     + '- Use at most 6 findings, 4 causes, 9 steps, 6 parts, 4 warnings.';
   const user = `<manual_sources>\n${src || '(none found)'}\n</manual_sources>\n\n`
