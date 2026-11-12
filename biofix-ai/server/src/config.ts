@@ -1,0 +1,58 @@
+// Environment-driven settings with production-safe defaults.
+
+export const isProd = () => process.env.NODE_ENV === 'production';
+
+/**
+ * Demo payments let "card" purchases succeed without charging. They are OFF unless switched on
+ * explicitly, so a server that was set up in a hurry can never give plans away by accident.
+ */
+export const demoPayments = (): boolean => process.env.DEMO_PAYMENTS === 'true';
+
+/**
+ * Without an SMTP server, e-mailed codes (address verification, password reset) can be printed in the
+ * server log for local testing. A code in a log is as good as the mailbox, so this is opt-in and never
+ * happens in production. PRINT_RESET_CODES is the older name of the same switch.
+ */
+export const printEmailCodes = (): boolean =>
+  (process.env.PRINT_EMAIL_CODES === 'true' || process.env.PRINT_RESET_CODES === 'true') && !isProd();
+
+export const MIN_ADMIN_TOKEN = 24;
+/** The developer key, or '' when unset or too short to be safe against guessing. */
+export function adminToken(): string {
+  const t = process.env.ADMIN_TOKEN || '';
+  return t.length >= MIN_ADMIN_TOKEN ? t : '';
+}
+
+export const MIN_RTDN_SECRET = 16;
+export function rtdnSecret(): string {
+  const t = process.env.PLAY_RTDN_SECRET || '';
+  return t.length >= MIN_RTDN_SECRET ? t : '';
+}
+
+/** Points given to a new account. They are worth money once real payments are on, so default to 0 then. */
+export function welcomePoints(): number {
+  const v = Number(process.env.WELCOME_POINTS);
+  if (process.env.WELCOME_POINTS !== undefined && Number.isFinite(v) && v >= 0) return Math.floor(v);
+  return demoPayments() ? 500 : 0;
+}
+
+/** Origins allowed to call the API from a browser. Native apps are not subject to CORS. */
+export function corsOrigins(): string[] {
+  return (process.env.CORS_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+/** Things worth fixing before real users arrive. Printed at startup. */
+export function securityWarnings(o: { play: boolean; mail: boolean; encrypted: boolean }): string[] {
+  const w: string[] = [];
+  const prod = isProd();
+  if (!prod) w.push('NODE_ENV is not "production": any website may call the API from a browser (CORS). Set NODE_ENV=production on the real server.');
+  if (demoPayments()) w.push('Demo payments are ON: plans, courses and points can be obtained without paying. Remove DEMO_PAYMENTS before real users arrive.');
+  if (printEmailCodes()) w.push('PRINT_EMAIL_CODES is ON: verification and password reset codes are written to this log. Development only.');
+  if (process.env.ADMIN_TOKEN && !adminToken()) w.push(`ADMIN_TOKEN is shorter than ${MIN_ADMIN_TOKEN} characters and is being ignored. Use: openssl rand -base64 32`);
+  if (process.env.PLAY_RTDN_SECRET && !rtdnSecret()) w.push(`PLAY_RTDN_SECRET is shorter than ${MIN_RTDN_SECRET} characters and is being ignored.`);
+  if (!o.encrypted) w.push('The data file is not encrypted at rest. Set DATA_ENCRYPTION_KEY (openssl rand -base64 32).');
+  if (!o.mail && !printEmailCodes()) w.push('SMTP_URL is not set: nobody can register (address verification) or reset a password.');
+  if (prod && !process.env.TRUST_PROXY) w.push('TRUST_PROXY is not set: behind a reverse proxy, rate limits and HTTPS detection will not see the real client.');
+  if (prod && !o.play) w.push('Google Play is not configured: purchases cannot be verified.');
+  return w;
+}
