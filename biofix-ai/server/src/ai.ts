@@ -110,23 +110,24 @@ function userContent(prompt: string, o: CallOptions): Anthropic.Beta.BetaContent
   ];
 }
 
-function mapError(e: unknown): never {
-  if (e instanceof AiError) throw e;
-  if (e instanceof Anthropic.APIUserAbortError) throw new AiError('cancelled');
-  if (e instanceof Anthropic.RateLimitError) throw new AiError('rate_limited');
-  if (e instanceof Anthropic.ContentTooLargeError) throw new AiError('prompt_too_large');
+/** What went wrong with a call, as one of our own error codes. */
+export function toAiError(e: unknown): AiError {
+  if (e instanceof AiError) return e;
+  if (e instanceof Anthropic.APIUserAbortError) return new AiError('cancelled');
+  if (e instanceof Anthropic.RateLimitError) return new AiError('rate_limited');
+  if (e instanceof Anthropic.ContentTooLargeError) return new AiError('prompt_too_large');
   if (e instanceof Anthropic.BadRequestError) {
     const msg = String(e.message || '');
-    if (/too long|too large|maximum context|too many pages/i.test(msg)) throw new AiError('prompt_too_large');
-    if (/image|pdf|document/i.test(msg)) throw new AiError('image_rejected');
-    throw new AiError('generic', msg);
+    if (/too long|too large|maximum context|too many pages/i.test(msg)) return new AiError('prompt_too_large');
+    if (/image|pdf|document/i.test(msg)) return new AiError('image_rejected');
+    return new AiError('generic', msg);
   }
-  if (e instanceof Anthropic.AuthenticationError || e instanceof Anthropic.PermissionDeniedError) throw new AiError('not_configured');
-  if (e instanceof Anthropic.NotFoundError) throw new AiError('not_configured', `the model "${MODEL}" or "${LIGHT_MODEL}" is not available to this API key`);
+  if (e instanceof Anthropic.AuthenticationError || e instanceof Anthropic.PermissionDeniedError) return new AiError('not_configured');
+  if (e instanceof Anthropic.NotFoundError) return new AiError('not_configured', `the model "${MODEL}" or "${LIGHT_MODEL}" is not available to this API key`);
   // Overloaded, a server error or no connection: nothing is wrong with the request, the service is busy.
-  if (e instanceof Anthropic.APIConnectionError || e instanceof Anthropic.InternalServerError) throw new AiError('busy', e.message);
-  if (e instanceof Anthropic.APIError) throw new AiError(e.status === undefined ? 'busy' : 'generic', `${e.status} ${e.message}`);
-  throw new AiError('generic', e instanceof Error ? e.message : String(e));
+  if (e instanceof Anthropic.APIConnectionError || e instanceof Anthropic.InternalServerError) return new AiError('busy', e.message);
+  if (e instanceof Anthropic.APIError) return new AiError(e.status === undefined ? 'busy' : 'generic', `${e.status} ${e.message}`);
+  return new AiError('generic', e instanceof Error ? e.message : String(e));
 }
 
 /** Request fields shared by every call. */
@@ -150,7 +151,7 @@ interface RequestOptions { signal: AbortSignal; maxRetries: number }
  * - Fast mode has its own, smaller capacity. The fast attempt does not wait for it: when the fast lane
  *   is full (or stumbles), the request goes out again at normal speed straight away.
  */
-async function run<T>(o: CallOptions, send: (fast: boolean, req: RequestOptions) => Promise<T>): Promise<T> {
+export async function run<T>(o: Pick<CallOptions, 'signal' | 'patient' | 'model'>, send: (fast: boolean, req: RequestOptions) => Promise<T>): Promise<T> {
   if (!aiConfigured()) throw new AiError('not_configured');
   const deadline = new AbortController();
   let timedOut = false;
@@ -169,7 +170,7 @@ async function run<T>(o: CallOptions, send: (fast: boolean, req: RequestOptions)
     return await send(false, { signal, maxRetries: o.patient ? 5 : 2 });
   } catch (e) {
     if (timedOut) throw new AiError('timeout');
-    mapError(e);
+    throw toAiError(e);
   } finally {
     clearTimeout(timer);
   }

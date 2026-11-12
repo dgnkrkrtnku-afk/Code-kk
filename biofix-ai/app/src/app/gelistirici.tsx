@@ -70,9 +70,9 @@ export default function Developer() {
       setBusy(t('k_reading'));
       if (f.kind === 'text') {
         // Decoded on the server: old text files are often not UTF-8, which is all a phone can read.
-        text = (await api.post<{ text: string }>('/admin/ingest-text', { data: f.data })).text;
+        text = (await api.post<{ text: string }>('/admin/ingest-text', { data: f.data }, undefined, 120_000)).text;
       } else {
-        const r = await api.post<{ mode: 'text' | 'ai'; scanned: number; text?: string; job?: string }>('/admin/ingest-pdf', { data: f.data, name: f.name, ai });
+        const r = await api.post<{ mode: 'text' | 'ai'; scanned: number; text?: string; job?: string }>('/admin/ingest-pdf', { data: f.data, name: f.name, ai }, undefined, 240_000);
         text = r.mode === 'ai' && r.job ? await waitForJob(r.job) : r.text || '';
         // Without AI on the server the scanned pages of a mixed manual are missing from the text: say so.
         if (r.mode === 'text' && r.scanned > 0) toast(t('k_scanned_n', r.scanned));
@@ -98,7 +98,7 @@ export default function Developer() {
       const texts: string[] = [];
       for (let i = 0; i < pages.length; i++) {
         setBusy(pages.length > 1 ? t('k_ocr_n', i + 1, pages.length) : t('k_ocr'));
-        const r = await api.post<{ text: string }>('/admin/ocr', { image: { data: pages[i].data, mediaType: pages[i].mediaType } });
+        const r = await api.post<{ text: string }>('/admin/ocr', { image: { data: pages[i].data, mediaType: pages[i].mediaType } }, undefined, 300_000);
         if (!alive.current) return;
         texts.push(r.text);
       }

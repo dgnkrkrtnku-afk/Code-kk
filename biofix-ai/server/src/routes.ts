@@ -1080,6 +1080,8 @@ export function createRouter(store: Store, deps: Deps) {
   interface Job { status: 'running' | 'done' | 'failed'; done: number; total: number; text: string; error: string; at: number }
   const jobs = new Map<string, Job>();
   const PAGES_PER_CALL = 4;
+  /** How many AI calls a manual job (reading pages, indexing sections) runs side by side. */
+  const PARALLEL = Math.min(8, Math.max(1, Number(process.env.BIOFIX_PARALLEL) || 3));
   const letters = (text: string) => text.replace(/\s/g, '').length;
   /** Fewer characters than this on a page means its text layer is missing (a scan) or it is a drawing. */
   const MIN_PAGE_TEXT = 40;
@@ -1126,7 +1128,7 @@ export function createRouter(store: Store, deps: Deps) {
       }
     };
     try {
-      await Promise.all([worker(), worker()]); // two page groups at a time
+      await Promise.all(Array.from({ length: PARALLEL }, worker)); // a few page groups at a time
       job.text = slots.filter(Boolean).join('\n\n');
       job.status = 'done';
     } catch (e) {
@@ -1167,13 +1169,23 @@ export function createRouter(store: Store, deps: Deps) {
     doc.ai = state;
     store.save();
     try {
-      for (let i = 0; i < todo.length; i += 10) {
-        if (!db().docs.includes(doc)) return; // deleted while indexing
-        await indexBatch(doc, todo.slice(i, i + 10));
-        state.done = already + Math.min(todo.length, i + 10);
-        store.reindex();
-        store.save();
-      }
+      const batches: Chunk[][] = [];
+      for (let i = 0; i < todo.length; i += 10) batches.push(todo.slice(i, i + 10));
+      let next = 0;
+      let failure: unknown = null;
+      const worker = async () => {
+        // After a failure the other workers finish the batch they are on and stop.
+        for (let batch = batches[next++]; batch && !failure; batch = batches[next++]) {
+          if (!db().docs.includes(doc)) return; // deleted while indexing
+          try { await indexBatch(doc, batch); } catch (e) { failure ??= e; return; }
+          state.done = Math.min(doc.chunks.length, state.done + batch.length);
+          store.reindex();
+          store.save();
+        }
+      };
+      await Promise.all(Array.from({ length: PARALLEL }, worker)); // a few batches at a time
+      if (!db().docs.includes(doc)) return;
+      if (failure) throw failure;
       state.status = 'done';
     } catch (e) {
       state.status = 'failed';
@@ -1352,7 +1364,7 @@ export function createRouter(store: Store, deps: Deps) {
 export function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFunction) {
   if (err instanceof HttpError) { res.status(err.status).json({ error: err.code }); return; }
   if (err instanceof ai.AiError) {
-    const status = err.code === 'rate_limited' ? 429 : err.code === 'not_configured' ? 503 : 502;
+    const status = err.code === 'rate_limited' ? 429 : err.code === 'not_configured' || err.code === 'busy' ? 503 : err.code === 'timeout' ? 504 : 502;
     if (err.code === 'generic') console.error('AI error:', err.message);
     res.status(status).json({ error: err.code });
     return;

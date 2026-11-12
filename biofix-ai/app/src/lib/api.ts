@@ -34,31 +34,45 @@ export const ERROR_KEY: Record<string, string> = {
   purchase_inactive: 'b_e_inactive', play_unavailable: 'b_e_unavailable', store_error: 'b_e_store', no_product: 'b_e_no_product',
   // abuse limits
   slow_down: 'e_slow', not_image: 'e_not_image', file_unreadable: 'e_file_unreadable', file_too_long: 'e_file_long',
-  job_failed: 'k_job_failed',
+  job_failed: 'k_job_failed', busy: 'e_busy', timeout: 'e_timeout',
 };
+
+/** How long an ordinary request may take before it is given up as "no connection". */
+const REQUEST_TIMEOUT = 45_000;
+/** A streamed answer sends a line at least every 15 seconds; this much silence means the connection is dead. */
+const STREAM_SILENCE = 50_000;
 
 /** Plain http is acceptable only for a server on this machine (development). */
 const LOOPBACK = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i;
 
 export function createApi(cfg: () => ApiConfig) {
-  async function req<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+  async function req<T>(method: string, path: string, body?: unknown, signal?: AbortSignal, timeoutMs = REQUEST_TIMEOUT): Promise<T> {
     const c = cfg();
     // Release builds never send credentials or personal data over an unencrypted connection.
     if (!__DEV__ && !/^https:\/\//i.test(c.baseUrl) && !LOOPBACK.test(c.baseUrl)) throw new ApiError('insecure_url');
     const headers: Record<string, string> = { 'content-type': 'application/json', 'x-lang': c.lang };
     if (c.token) headers.authorization = `Bearer ${c.token}`;
     if (c.adminToken) headers['x-admin-token'] = c.adminToken;
+    // A request that hangs (a dead mobile connection) must end by itself instead of spinning forever.
+    const ctl = new AbortController();
+    const onAbort = () => ctl.abort();
+    signal?.addEventListener('abort', onAbort);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, timeoutMs);
     let res: Response;
+    let json: unknown = null;
     try {
       res = await fetch(c.baseUrl.replace(/\/+$/, '') + '/api' + path, {
-        method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal,
+        method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: ctl.signal,
       });
-    } catch (e) {
+      try { json = await res.json(); } catch { if (ctl.signal.aborted) throw new Error('aborted'); /* otherwise: an empty body */ }
+    } catch {
       if (signal?.aborted) throw new ApiError('cancelled');
-      throw new ApiError('network');
+      throw new ApiError(timedOut ? 'timeout' : 'network');
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
     }
-    let json: unknown = null;
-    try { json = await res.json(); } catch { /* empty body */ }
     if (!res.ok) {
       const code = (json as { error?: string } | null)?.error || 'generic';
       if (res.status === 401 && code === 'no_session' && c.token) c.onUnauthorized();
@@ -78,21 +92,36 @@ export function createApi(cfg: () => ApiConfig) {
     const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'application/x-ndjson', 'x-lang': c.lang };
     if (c.token) headers.authorization = `Bearer ${c.token}`;
     if (c.adminToken) headers['x-admin-token'] = c.adminToken;
-    const fail = () => new ApiError(signal?.aborted ? 'cancelled' : 'network');
+    // Stop (the caller's signal) and our own watchdog for a connection that has gone silent share one controller.
+    const ctl = new AbortController();
+    const onAbort = () => ctl.abort();
+    signal?.addEventListener('abort', onAbort);
+    let silent = false;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    const alive = () => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(() => { silent = true; ctl.abort(); }, STREAM_SILENCE);
+    };
+    const cleanup = () => { clearTimeout(watchdog); signal?.removeEventListener('abort', onAbort); };
+    const fail = () => new ApiError(signal?.aborted ? 'cancelled' : silent ? 'timeout' : 'network');
     // React Native's own fetch only hands over a finished response; Expo's can be read while it arrives.
     const doFetch = (Platform.OS === 'web' ? fetch : expoFetch) as typeof fetch;
     let res: Response;
     try {
-      res = await doFetch(c.baseUrl.replace(/\/+$/, '') + '/api' + path, { method: 'POST', headers, body: JSON.stringify(body), signal });
+      // The upload (photos, a file) can take a while on a slow connection; the watchdog starts once the answer does.
+      res = await doFetch(c.baseUrl.replace(/\/+$/, '') + '/api' + path, { method: 'POST', headers, body: JSON.stringify(body), signal: ctl.signal });
     } catch {
+      cleanup();
       throw fail();
     }
     if (!res.ok) {
       let code = 'generic';
       try { code = ((await res.json()) as { error?: string }).error || 'generic'; } catch { /* no body */ }
+      cleanup();
       if (res.status === 401 && code === 'no_session' && c.token) c.onUnauthorized();
       throw new ApiError(code, res.status);
     }
+    alive();
 
     let finished = false;
     const handle = (line: string) => {
@@ -113,6 +142,7 @@ export function createApi(cfg: () => ApiConfig) {
         let buf = new Uint8Array(0);
         for (;;) {
           const { done, value } = await reader.read();
+          alive();
           if (value?.length) {
             const next = new Uint8Array(buf.length + value.length);
             next.set(buf);
@@ -130,6 +160,8 @@ export function createApi(cfg: () => ApiConfig) {
     } catch (e) {
       if (e instanceof ApiError) throw e;
       throw fail();
+    } finally {
+      cleanup();
     }
     if (!finished) throw fail(); // the connection dropped before the answer was complete
   }
@@ -137,7 +169,8 @@ export function createApi(cfg: () => ApiConfig) {
   return {
     stream,
     get: <T>(p: string, signal?: AbortSignal) => req<T>('GET', p, undefined, signal),
-    post: <T>(p: string, b?: unknown, signal?: AbortSignal) => req<T>('POST', p, b ?? {}, signal),
+    /** `timeoutMs`: raise it for calls that upload a lot or wait for the AI (reading a label, a page, a PDF). */
+    post: <T>(p: string, b?: unknown, signal?: AbortSignal, timeoutMs?: number) => req<T>('POST', p, b ?? {}, signal, timeoutMs),
     patch: <T>(p: string, b: unknown) => req<T>('PATCH', p, b),
     del: <T>(p: string) => req<T>('DELETE', p),
   };

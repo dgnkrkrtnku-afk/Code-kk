@@ -236,12 +236,14 @@ export function Note({ children }: { children: ReactNode }) {
 }
 
 /** Collapsible block — the prototype's <details>. */
-export function Details({ title, children, defaultOpen, link }: { title: ReactNode; children: ReactNode; defaultOpen?: boolean; link?: boolean }) {
+export function Details({ title, children, defaultOpen, link, onToggle }: {
+  title: ReactNode; children: ReactNode; defaultOpen?: boolean; link?: boolean; onToggle?: (open: boolean) => void;
+}) {
   const { c } = useApp();
   const [open, setOpen] = useState(!!defaultOpen);
   return (
     <View style={link ? { marginTop: 6 } : { borderColor: c.line, borderWidth: 1, borderRadius: 10, marginBottom: 7 }}>
-      <Pressable onPress={() => setOpen(!open)} style={{ padding: link ? 0 : 10, flexDirection: 'row', gap: 6 }}>
+      <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} onPress={() => { setOpen(!open); onToggle?.(!open); }} style={{ padding: link ? 0 : 10, flexDirection: 'row', gap: 6 }}>
         <Text style={{ color: link ? c.cyan : c.ink, fontWeight: '600', fontSize: 13, flex: 1 }}>{open ? '▾ ' : '▸ '}{title}</Text>
       </Pressable>
       {open ? <View style={{ paddingHorizontal: link ? 0 : 11, paddingBottom: link ? 0 : 11, paddingTop: link ? 6 : 0 }}>{children}</View> : null}

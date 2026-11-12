@@ -95,7 +95,7 @@ export default function Assistant() {
       if (img === 'denied') { toast(t('e_perm')); return; }
       if (!img) return;
       setScanning(true);
-      const r = await api.post<DeviceLabel>('/identify-device', { image: { data: img.data, mediaType: img.mediaType } });
+      const r = await api.post<DeviceLabel>('/identify-device', { image: { data: img.data, mediaType: img.mediaType } }, undefined, 120_000);
       if (r.device) { setDev(r.device); toast(t('a_label_ok', r.device)); }
       else if (r.label) { setDev(r.label); toast(t('a_label_new', r.label)); }
       else toast(t('a_label_none'));

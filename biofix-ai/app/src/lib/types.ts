@@ -41,7 +41,8 @@ export interface AuthResult { token: string; me: Me }
 
 export interface SolutionView {
   id: string; by: string; brand: string; model: string; symptom: string; code: string; steps: string; part: string;
-  photo: string; photoNote: string; ok: number; fail: number; date: string;
+  /** Always '' in lists; the card fetches the picture when it is opened (see hasPhoto). */
+  photo: string; hasPhoto?: boolean; photoNote: string; ok: number; fail: number; date: string;
   ai: { v: 'consistent' | 'conflict' | 'not_covered'; note: string; safe: boolean } | null;
   status: SolStatus; mine: boolean; myVote: 'ok' | 'fail' | null; canDelete: boolean; checking: boolean;
   /** The AI pre-check flagged a safety risk; it stays unverified until a developer clears it. */
@@ -54,6 +55,8 @@ export interface Diagnosis {
   firstAction?: string;
   /** What the technician could tell the assistant to narrow the diagnosis down. */
   questions?: string[];
+  /** What the supplied data (readings, log lines, photos) shows, each with its interpretation. */
+  findings?: Finding[];
   confidence: Level; grounded: boolean;
   causes: { title: string; why: string; likelihood: Level }[];
   steps: { title: string; detail: string; measure: string | null; source: number | null }[];
@@ -61,13 +64,32 @@ export interface Diagnosis {
   warnings: string[]; community: number[];
 }
 
+export interface Finding { observation: string; meaning: string; status: 'normal' | 'abnormal' | 'unclear' }
+
+/** A reading that repeats in a log, or a numeric column of a table. */
+export interface Series {
+  name: string; unit: string; n: number; min: number; max: number; mean: number; first: number; last: number;
+  trend: 'up' | 'down' | 'flat';
+}
+
+/** What the server worked out from an attached log or table, without AI. */
+export interface DataDigest {
+  kind: 'log' | 'table'; lines: number; from: string; to: string; errors: number; warnings: number;
+  codes: { code: string; count: number; first: string; last: string }[];
+  series: Series[];
+  repeated: { text: string; count: number }[];
+}
+
+/** A value measured at a step and how it compares with the value the step expects. */
+export interface Reading { value: string; status: 'ok' | 'low' | 'high' | 'unknown'; deviation: number | null }
+
 export interface Source { title: string; h: string; t: string }
 
 /** A manual's explanation of an error code. */
 export interface CodeHit { code: string; text: string; device: string; title: string }
 
 /** What the knowledge base says about a fault before any AI is involved; arrives within milliseconds. */
-export interface Quick { codes: CodeHit[]; sols: SolutionView[]; docs: Source[] }
+export interface Quick { codes: CodeHit[]; sols: SolutionView[]; docs: Source[]; data?: DataDigest | null }
 
 /** Shortcuts for a device: faults others already solved on it, and the codes its manuals define. */
 export interface QuickList {
@@ -94,6 +116,11 @@ export interface HistoryItem {
   follow: { q: string; a: string }[]; solIds: string[]; srcs: Source[]; sols: SolutionView[];
   codes?: CodeHit[];
   attached?: { photos: number; file: string };
+  data?: DataDigest;
+  /** Measured values keyed by step number. */
+  readings?: Record<string, Reading>;
+  /** The answer was reused from an identical earlier question. */
+  stored?: boolean;
 }
 
 export interface CourseView {

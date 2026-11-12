@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ActivityIndicator, Image, Text, View } from 'react-native';
 import { useApp } from '../lib/app-context';
 import type { Me, SolutionView } from '../lib/types';
@@ -13,6 +13,15 @@ export function SolutionCard({ s, open, onChange, onDelete }: {
 }) {
   const { c, t, api, me, setMe, toast, errText, bump } = useApp();
   const [busy, setBusy] = useState('');
+  const [shown, setShown] = useState(!!open);
+  // Lists carry no picture data (it would slow every list down); the photo is fetched when the solution is opened.
+  const [photo, setPhoto] = useState(s.photo);
+  useEffect(() => {
+    if (!shown || photo || !s.hasPhoto) return;
+    let alive = true;
+    api.get<{ photo: string }>(`/solutions/${s.id}/photo`).then((r) => { if (alive) setPhoto(r.photo); }).catch(() => {});
+    return () => { alive = false; };
+  }, [shown, photo, s.hasPhoto, s.id, api]);
   const pt = me?.pt.vote ?? 5;
   const needOk = me?.needOk ?? 3;
 
@@ -58,11 +67,13 @@ export function SolutionCard({ s, open, onChange, onDelete }: {
         <Text style={{ fontWeight: '700', fontSize: 14.5, color: c.ink, flexShrink: 1 }}>{s.symptom}</Text>
         {s.code ? <Tag>{s.code}</Tag> : null}
       </Row>
-      <Details link title={t('c_show')} defaultOpen={open}>
+      <Details link title={t('c_show')} defaultOpen={open} onToggle={setShown}>
         <P selectable>{s.steps}</P>
         {s.part ? <P small style={{ marginTop: 8 }}><Text style={{ fontWeight: '700' }}>{t('c_part')}: </Text>{s.part}</P> : null}
         {/* Only inline image data is ever shown, never a remote address. */}
-        {s.photo.startsWith('data:image/') ? <Image source={{ uri: s.photo }} style={{ width: '100%', aspectRatio: 4 / 3, borderRadius: 10, marginTop: 8 }} resizeMode="cover" /> : null}
+        {photo.startsWith('data:image/') ? (
+          <Image source={{ uri: photo }} style={{ width: '100%', aspectRatio: 4 / 3, borderRadius: 10, marginTop: 8 }} resizeMode="cover" />
+        ) : s.hasPhoto ? <ActivityIndicator size="small" color={c.cyan} style={{ marginTop: 8, alignSelf: 'flex-start' }} /> : null}
         {s.photoNote ? <P small muted style={{ marginTop: 6 }}>{'📷 ' + s.photoNote}</P> : null}
       </Details>
       <P small muted mono style={{ marginTop: 9 }}>{t('c_votes', s.ok, s.fail)}</P>
