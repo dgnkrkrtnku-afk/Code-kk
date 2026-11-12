@@ -2,7 +2,7 @@ import { router } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Image, Pressable, ScrollView, Text, View } from 'react-native';
 import { Icon } from '../../components/icons';
-import { CodeCards, QuickResults } from '../../components/QuickResults';
+import { CodeCards, DataCard, hasData, QuickResults } from '../../components/QuickResults';
 import { Report, TeachCta } from '../../components/Report';
 import { Btn, Card, H1, H2, Input, P, Row, Screen, Select, Sub, Tag, WarnBox } from '../../components/ui';
 import { qs } from '../../lib/api';
@@ -12,6 +12,8 @@ import { MONO } from '../../lib/theme';
 import type { DeviceLabel, Diagnosis, FilePayload, HistoryItem, ImagePayload, Quick, QuickList } from '../../lib/types';
 
 const MAX_PHOTOS = 4;
+/** Failures that are worth trying again as they are: a busy service, a dropped connection, a garbled answer. */
+const TRANSIENT = new Set(['busy', 'timeout', 'network', 'rate_limited', 'invalid_json', 'generic', 'slow_down']);
 
 export default function Assistant() {
   const { c, t, api, me, refreshMe, errText, toast, version } = useApp();
@@ -27,9 +29,11 @@ export default function Assistant() {
   const [partial, setPartial] = useState<Diagnosis | null>(null); // the AI answer while it is being written
   const [cur, setCur] = useState<HistoryItem | null>(null);   // the finished, saved diagnosis
   const [aiOff, setAiOff] = useState(false);                   // the answer was instant results only
+  // The AI could not answer; the instant results stay on screen. 'retry': trying again may well work.
+  const [failed, setFailed] = useState<'' | 'retry' | 'final'>('');
   const [shortcuts, setShortcuts] = useState<QuickList | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
-  const ctl = useRef<AbortController | null>(null);
+  const ctlRef = useRef<AbortController | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -106,15 +110,24 @@ export default function Assistant() {
     }
   }
 
-  async function solve(text = q) {
+  /** `fresh`: ask the AI again even when a stored answer exists. */
+  async function solve(text = q, fresh = false) {
     setErr('');
     if (!text.trim() && !photos.length && !file) { toast(t('a_need')); return; }
     if (me?.ai && plan && !unlimited(plan.quota) && me.user.usedToday >= plan.quota) { setErr(t('a_limit')); return; }
-    setBusy(true); setQuick(null); setPartial(null); setCur(null); setAiOff(false);
-    ctl.current = new AbortController();
+    setBusy(true); setQuick(null); setPartial(null); setCur(null); setAiOff(false); setFailed('');
+    const ctl = new AbortController();
+    ctlRef.current = ctl;
+    // Photos and files take time to upload on a mobile connection. What the manuals and other technicians
+    // already say needs none of that: ask for it separately so it is on screen while the upload runs.
+    if (photos.length || file) {
+      api.post<{ quick: Quick }>('/search', { q: text, dev }, ctl.signal)
+        .then((r) => { if (!ctl.signal.aborted) setQuick((now) => now ?? r.quick); })
+        .catch(() => { /* the full answer brings the instant results too */ });
+    }
     try {
       await api.stream('/diagnose', {
-        q: text, dev,
+        q: text, dev, fresh,
         images: photos.map((p) => ({ data: p.data, mediaType: p.mediaType })),
         file,
       }, (e) => {
@@ -130,14 +143,20 @@ export default function Assistant() {
             setPhotos([]); setFile(null);
           } else setAiOff(true);
         }
-      }, ctl.current.signal);
+      }, ctl.signal);
       refreshMe();
     } catch (e) {
       const code = (e as { code?: string }).code;
       setPartial(null);
-      if (code !== 'cancelled') setErr(code === 'quota' ? t('a_limit') : errText(e));
+      if (code !== 'cancelled') {
+        setErr(code === 'quota' ? t('a_limit') : errText(e));
+        // Whatever was found without AI is still an answer: keep it on screen, in full.
+        setFailed(code && TRANSIENT.has(code) ? 'retry' : 'final');
+      }
     } finally {
-      setBusy(false); ctl.current = null;
+      ctl.abort(); // ends the separate search too, if it is still running
+      setBusy(false);
+      if (ctlRef.current === ctl) ctlRef.current = null;
     }
   }
 
@@ -235,24 +254,31 @@ export default function Assistant() {
           </Row>
         ) : null}
         {busy
-          ? <Btn kind="sec" full title={t('a_stop')} onPress={() => ctl.current?.abort()} />
+          ? <Btn kind="sec" full title={t('a_stop')} onPress={() => ctlRef.current?.abort()} />
           : <Btn full title={t('a_go')} onPress={() => solve()} />}
       </Card>
 
-      {err ? <WarnBox>{err}</WarnBox> : null}
+      {err ? (
+        <View>
+          <WarnBox>{failed && quick ? `${err} ${t('a_ai_failed')}` : err}</WarnBox>
+          {failed === 'retry' ? <Btn kind="sec" full style={{ marginBottom: 12 }} title={t('a_retry')} onPress={() => solve()} /> : null}
+        </View>
+      ) : null}
 
       {/* 1. Instant: what the manuals and other technicians already say. */}
       {busy && !quick ? (
         <Card accent={c.cyan}><Row><ActivityIndicator size="small" color={c.cyan} /><P bold>{t('loading')}</P></Row></Card>
       ) : null}
-      {quick && (busy || aiOff) ? (
+      {quick && (busy || aiOff || failed) ? (
         <>
           <H2 style={{ marginTop: 6 }}>{t('a_quick')}</H2>
-          <QuickResults quick={quick} full={aiOff} />
+          <QuickResults quick={quick} full={aiOff || !!failed} />
           {aiOff ? <TeachCta onTeach={teachFrom} /> : null}
         </>
       ) : null}
-      {quick && cur && quick.codes.length ? <CodeCards codes={quick.codes} /> : null}
+      {/* With the finished report: what the attached data contains, and what the manual says about its codes. */}
+      {cur && hasData(cur.data) ? <DataCard data={cur.data} /> : null}
+      {cur?.codes?.length ? <CodeCards codes={cur.codes} /> : null}
 
       {/* 2. The AI diagnosis, shown while it is written and then as the saved record. */}
       {busy && quick && !partial && me?.ai ? (
@@ -262,7 +288,12 @@ export default function Assistant() {
         </Card>
       ) : null}
       {partial && !cur ? <Report x={null} res={partial} dev={dev} onChange={setCur} onTeach={teachFrom} /> : null}
-      {cur ? <Report x={cur} res={cur.res} dev={cur.dev} onChange={setCur} onTeach={teachFrom} /> : null}
+      {cur ? (
+        <Report
+          key={cur.id} x={cur} res={cur.res} dev={cur.dev} onTeach={teachFrom} onRegenerate={() => solve(cur.q, true)}
+          onChange={(item) => { setCur(item); setHistory((h) => h.map((x) => (x.id === item.id ? item : x))); }}
+        />
+      ) : null}
 
       {history.length ? (
         <>
@@ -272,8 +303,8 @@ export default function Assistant() {
               <Pressable
                 key={x.id}
                 onPress={() => {
-                  setCur(x); setQ(x.q); setDev(x.dev); setErr(''); setPartial(null); setAiOff(false);
-                  setQuick(x.codes?.length ? { codes: x.codes, sols: [], docs: [] } : null);
+                  setCur(x); setQ(x.q); setDev(x.dev); setErr(''); setPartial(null); setAiOff(false); setFailed('');
+                  setQuick(null);
                 }}
                 style={{ flexDirection: 'row', gap: 10, alignItems: 'center', paddingVertical: 11, borderBottomWidth: i === Math.min(history.length, 8) - 1 ? 0 : 1, borderBottomColor: c.line }}
               >

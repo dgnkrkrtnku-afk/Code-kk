@@ -32,6 +32,7 @@ export const EXTRA = {
     k_ai_run: 'AI ile dizinle', k_ai_running: 'AI dizinliyor: {0} / {1}', k_ai_done: 'AI dizini hazır', k_ai_failed: 'AI dizini tamamlanamadı',
     k_ai_d: 'AI dizini her bölüme Türkçe ve İngilizce arama sözcükleri ile hata kodlarını ekler; İngilizce kılavuzlar Türkçe arıza tanımıyla bulunur.',
     k_codes_n: '{0} hata kodu',
+    f_photo_add: 'Onarım fotoğrafı ekle',
     // data interpretation
     dt_title: 'Veri özeti', dt_log: 'Günlük, {0} satır', dt_table: 'Tablo, {0} satır',
     dt_errors: '{0} hata satırı', dt_warnings: '{0} uyarı satırı', dt_codes: 'Dosyada geçen hata kodları',
@@ -134,6 +135,7 @@ export const EXTRA = {
     k_ai_run: 'Index with AI', k_ai_running: 'AI indexing: {0} / {1}', k_ai_done: 'AI index ready', k_ai_failed: 'AI index did not finish',
     k_ai_d: 'The AI index adds Turkish and English search words and the error codes to every section, so English manuals are found from a Turkish fault description.',
     k_codes_n: '{0} error codes',
+    f_photo_add: 'Add a repair photo',
     dt_title: 'Data summary', dt_log: 'Log, {0} lines', dt_table: 'Table, {0} rows',
     dt_errors: '{0} error lines', dt_warnings: '{0} warning lines', dt_codes: 'Error codes in the file',
     dt_series: 'Readings', dt_min: 'min', dt_mean: 'mean', dt_max: 'max', dt_last: 'last',

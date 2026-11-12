@@ -1,10 +1,10 @@
 import { router } from 'expo-router';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, Text, View } from 'react-native';
 import { useApp } from '../lib/app-context';
 import { setPendingMarketQuery } from '../lib/market-query';
 import { MONO } from '../lib/theme';
-import type { Diagnosis, HistoryItem, Level } from '../lib/types';
+import type { Diagnosis, HistoryItem, Level, Reading } from '../lib/types';
 import { SourceBox } from './QuickResults';
 import { SolutionCard } from './SolutionCard';
 import { Badge, Btn, Card, Input, P, Row, Tag, WarnBox, type Tone } from './ui';
@@ -24,12 +24,67 @@ export function TeachCta({ onTeach }: { onTeach: () => void }) {
   );
 }
 
+const VERDICT: Record<Reading['status'], [Tone, string, string]> = {
+  ok: ['ok', '✓', 'rd_ok'], low: ['bad', '↓', 'rd_low'], high: ['bad', '↑', 'rd_high'], unknown: ['info', '?', 'rd_unknown'],
+};
+
+/**
+ * Where the technician enters what was measured at a step. The server compares it with the value
+ * the step expects and answers at once: within range, low or high.
+ */
+function ReadingRow({ x, i, onChange }: { x: HistoryItem; i: number; onChange: (x: HistoryItem) => void }) {
+  const { c, t, api, toast, errText } = useApp();
+  const saved = x.readings?.[i];
+  const [value, setValue] = useState(saved?.value ?? '');
+  const [busy, setBusy] = useState(false);
+  const sending = useRef(false); // leaving the field and pressing Save both ask to save: once is enough
+
+  async function save() {
+    const v = value.trim();
+    if (sending.current || v === (saved?.value ?? '')) return;
+    sending.current = true;
+    setBusy(true);
+    try {
+      onChange((await api.post<{ item: HistoryItem }>(`/history/${x.id}/readings`, { i, value: v })).item);
+    } catch (e) {
+      toast(errText(e));
+    } finally {
+      sending.current = false;
+      setBusy(false);
+    }
+  }
+
+  const v = saved ? VERDICT[saved.status] : null;
+  return (
+    <View style={{ marginTop: 7 }}>
+      <Row gap={7} style={{ alignItems: 'center' }}>
+        <Input
+          half value={value} onChangeText={setValue} placeholder={t('rd_ph')} accessibilityLabel={`${t('rd_ph')} ${i + 1}`}
+          onSubmitEditing={save} onBlur={save} returnKeyType="done" autoCapitalize="none" autoCorrect={false} maxLength={60}
+          style={{ paddingVertical: 7, fontSize: 14 }}
+        />
+        <Btn sm kind="sec" title={t('rd_save')} busy={busy} onPress={save} style={{ marginBottom: 12 }} />
+      </Row>
+      {v && saved ? (
+        <Row wrap gap={7} style={{ marginTop: -5 }}>
+          <Badge tone={v[0]}>{`${v[1]} ${t(v[2])}`}</Badge>
+          {saved.deviation !== null && saved.deviation !== 0 ? (
+            <Text style={{ fontFamily: MONO, fontSize: 12, color: c.muted }}>{t('rd_dev', (saved.deviation > 0 ? '+' : '') + String(saved.deviation).replace('.', ','))}</Text>
+          ) : null}
+        </Row>
+      ) : null}
+    </View>
+  );
+}
+
 /**
  * The diagnosis "work order" (föy). While the AI is still writing, `x` is null and `res` holds
  * what has arrived so far; the sections fill in from top to bottom.
  */
-export function Report({ x, res, dev, onChange, onTeach }: {
+export function Report({ x, res, dev, onChange, onTeach, onRegenerate }: {
   x: HistoryItem | null; res: Diagnosis; dev: string; onChange: (x: HistoryItem) => void; onTeach: () => void;
+  /** Ask the AI again instead of showing the stored answer. */
+  onRegenerate?: () => void;
 }) {
   const { c, t, api, me, errText } = useApp();
   const [fq, setFq] = useState('');
@@ -46,8 +101,8 @@ export function Report({ x, res, dev, onChange, onTeach }: {
     api.patch(`/history/${x.id}/steps`, { i, done }).catch(() => {});
   }
 
-  async function ask() {
-    const q = fq.trim();
+  async function ask(text = fq) {
+    const q = text.trim();
     if (!q || live || !x) return;
     setFErr('');
     setLive({ q, a: '' });
@@ -96,6 +151,12 @@ export function Report({ x, res, dev, onChange, onTeach }: {
               {r.grounded ? <Badge tone="info">{'✓ ' + t('r_grounded')}</Badge> : <Badge tone="warn">{'⚠ ' + t('r_generic')}</Badge>}
             </Row>
           ) : null}
+          {x?.stored ? (
+            <Row wrap style={{ backgroundColor: c.sunk, borderRadius: 9, paddingVertical: 6, paddingHorizontal: 10, marginBottom: 10 }}>
+              <P small muted style={{ flex: 1, minWidth: 180 }}>{'⚡ ' + t('a_stored')}</P>
+              {onRegenerate ? <Btn kind="ghost" sm title={t('a_regen')} onPress={onRegenerate} /> : null}
+            </Row>
+          ) : null}
           <P style={{ fontSize: 15, lineHeight: 22 }}>{r.summary}</P>
 
           {r.firstAction ? (
@@ -104,6 +165,18 @@ export function Report({ x, res, dev, onChange, onTeach }: {
               <Text style={{ color: c.ink, fontWeight: '600', fontSize: 14.5, lineHeight: 21 }}>{r.firstAction}</Text>
             </View>
           ) : null}
+
+          {/* What the supplied data shows: readings in the report, lines of an attached log, photos. */}
+          {r.findings?.length ? <H3>{t('fd_title')}</H3> : null}
+          {r.findings?.map((f, i) => (
+            <Row key={i} style={{ alignItems: 'flex-start', marginBottom: 9 }} gap={10}>
+              <Badge tone={f.status === 'abnormal' ? 'bad' : f.status === 'normal' ? 'ok' : 'warn'}>{t('fd_' + f.status)}</Badge>
+              <View style={{ flex: 1 }}>
+                <P bold selectable>{f.observation}</P>
+                {f.meaning ? <P small muted>{f.meaning}</P> : null}
+              </View>
+            </Row>
+          ))}
 
           {r.causes.length ? <H3>{t('r_causes')}</H3> : null}
           {r.causes.map((cs, i) => (
@@ -133,10 +206,14 @@ export function Report({ x, res, dev, onChange, onTeach }: {
                       <Text style={{ fontFamily: MONO, fontSize: 12, color: c.ink }}>{`${t('r_meas')}: ${s.measure}`}</Text>
                     </View>
                   ) : null}
+                  {x && s.measure ? <ReadingRow key={`${x.id}:${i}`} x={x} i={i} onChange={onChange} /> : null}
                 </View>
               </View>
             );
           })}
+          {x && me?.ai && Object.keys(x.readings ?? {}).length ? (
+            <Btn full kind="sec" style={{ marginTop: 10 }} title={t('rd_reassess')} busy={!!live} onPress={() => ask(t('rd_question'))} />
+          ) : null}
 
           {r.parts.length || x ? <H3>{t('r_parts')}</H3> : null}
           {r.parts.length ? r.parts.map((p, i) => (
@@ -177,8 +254,8 @@ export function Report({ x, res, dev, onChange, onTeach }: {
                 </View>
               ) : null}
               <Row style={{ alignItems: 'flex-start' }}>
-                <Input half value={fq} onChangeText={setFq} placeholder={t('r_follow_ph')} onSubmitEditing={ask} returnKeyType="send" />
-                <Btn title={t('r_ask')} busy={!!live} onPress={ask} />
+                <Input half value={fq} onChangeText={setFq} placeholder={t('r_follow_ph')} onSubmitEditing={() => ask()} returnKeyType="send" />
+                <Btn title={t('r_ask')} busy={!!live} onPress={() => ask()} />
               </Row>
               {fErr ? <WarnBox>{fErr}</WarnBox> : null}
               {[...x.follow, ...(live ? [live] : [])].map((f, i) => (

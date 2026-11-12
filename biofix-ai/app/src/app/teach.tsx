@@ -60,7 +60,7 @@ export default function Teach() {
       {photo ? <Image source={{ uri: photo.uri }} style={{ width: '100%', aspectRatio: 4 / 3, borderRadius: 10, marginBottom: 8 }} /> : null}
       {photo ? <P small muted style={{ marginBottom: 8 }}>{t('a_photo_privacy')}</P> : null}
       <Row style={{ marginBottom: 12 }}>
-        <Btn kind="sec" style={{ flex: 1 }} title={photo ? '✓ ' + t('f_photo_ok') : t('f_photo')} onPress={() => addPhoto('library')} />
+        <Btn kind="sec" style={{ flex: 1 }} title={photo ? '✓ ' + t('f_photo_ok') : t('f_photo_add')} onPress={() => addPhoto('library')} />
         <Btn kind="sec" title={t('camera')} onPress={() => addPhoto('camera')} />
       </Row>
       <Row>
